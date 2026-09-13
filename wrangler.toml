@@ -12,7 +12,7 @@ crons = ["0 23 * * *"]
 # KV 命名空间（先执行：wrangler kv:namespace create YTKV）
 [[kv_namespaces]]
 binding = "KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "178d6588564149eb8b80d92d8d51386d"
 
 # Workers AI 绑定（如使用 Workers AI 做总结，免费额度充足）
 [ai]
