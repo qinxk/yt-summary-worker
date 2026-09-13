@@ -1,6 +1,6 @@
-.dev.vars
-.dev.vars.local
 node_modules
 .wrangler
 *.log
-.DS_Store
+.env
+.env.*
+wrangler.toml.local

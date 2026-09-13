@@ -1,16 +1,6 @@
-# 本地开发用（wrangler dev 会自动读取 .dev.vars）
-# ⚠️ 此文件不要提交到 GitHub（已在 .gitignore 中）
+# 本地开发用环境变量（wrangler dev 会自动加载 .dev.vars）
+# 线上请改用 `wrangler secret put <NAME>`，不要提交真实值
 
-# 手动触发密钥（GET /run-once?token=xxx）
-API_TOKEN=your_random_token_here
-
-# 企业微信群机器人 Webhook（https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx）
-WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=your_key
-
-# LLM API Key（讯飞/OpenAI 兼容接口）
-LLM_KEY=your_llm_api_key
-
-# ---------- 以下非敏感变量已写在 wrangler.toml 的 [vars] 段，无需在此重复 ----------
-# CHANNELS   = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
-# LLM_URL    = "https://one.iflytek.com/api/llm/console/chat/v1"
-# LLM_MODEL  = "claude-opus-5"
+GEMINI_API_KEY=your_gemini_api_key_here
+WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+API_TOKEN=your_custom_token_here

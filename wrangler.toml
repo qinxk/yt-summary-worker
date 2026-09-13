@@ -7,24 +7,28 @@ enabled = true
 head_sampling_rate = 1
 
 [vars]
-# 监控的 YouTube 频道（channel_id 列表）
-CHANNELS = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
+# ===== 必改：监控的 YouTube 频道（channel_id）=====
+#   支持两种写法：数组 ["UCxxx","UCyyy"] 或 逗号分隔 "UCxxx,UCyyy"
+CHANNELS = "UCkHrq03gWLLx6vjS2DOJ8aA"
 
-# Gemini 模型兜底链（2026 年：3.x 系列，按你账号实际可用模型调整）
-# 调用顺序：依次尝试，429/5xx 重试，404/400 立即跳过换下一个
-GEMINI_MODELS = '["gemini-3.5-flash","gemini-3.5-flash-lite","gemini-3-flash"]'
-GEMINI_MODEL = "gemini-3.5-flash"
+# ===== Gemini 模型兜底链（已对齐你账号实测可用清单）=====
+#   调用顺序：依次尝试；429/5xx 重试；400/404/410 立即跳过换下一个
+#   主力放最前（2.5-flash 最稳），3.x 预览放最后（晚高峰易限流）
+#   ⚠️ 若你的 key 对某些模型报 404，直接从下面数组删掉即可
+GEMINI_MODELS = '["gemini-2.5-flash","gemini-2.5-flash-lite","gemini-flash-latest","gemini-3-flash-preview"]'
+GEMINI_MODEL = "gemini-2.5-flash"
 
-# 每次触发最多处理的视频数（分批，避免超时）
+# 每次触发最多处理的视频数（分批，避免超时；免费层建议 1-3）
 BATCH_SIZE = "3"
 
 # 每条视频之间的节流间隔（毫秒），避免打爆免费层 RPM
 THROTTLE_MS = "2000"
 
-# Cron 触发：每天 UTC 22:00 = 北京时间 06:00（避开晚高峰）
-# 如需改时间，调整此处即可
+# Cron：每天 UTC 22:00 = 北京时间 06:00（避开晚高峰，容量充裕）
+#   如需改时间，调整此处即可（按需取消注释切换）
 [triggers]
 crons = ["0 22 * * *"]
+# crons = ["0 */6 * * *"]   # 每 6 小时一次
 
 [[kv_namespaces]]
 binding = "KV"
