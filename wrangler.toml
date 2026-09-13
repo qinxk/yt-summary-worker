@@ -9,7 +9,11 @@ compatibility_date = "2026-09-01"
 [triggers]
 crons = ["0 23 * * *"]
 
+# 启用 workers.dev 默认域名（如不需要可设为 false，改用自定义域）
+workers_dev = true
+
 # KV 命名空间（先执行：wrangler kv:namespace create YTKV）
+# 把 id 换成你在 Cloudflare Dashboard 实际创建的命名空间 ID
 [[kv_namespaces]]
 binding = "KV"
 id = "178d6588564149eb8b80d92d8d51386d"
@@ -17,3 +21,13 @@ id = "178d6588564149eb8b80d92d8d51386d"
 # Workers AI 绑定（如使用 Workers AI 做总结，免费额度充足）
 [ai]
 binding = "AI"
+
+# ---------- 非敏感变量（写在这里，wrangler deploy 时会一起部署，不会被清空）----------
+# ⚠️ 敏感信息（API_TOKEN / LLM_KEY / WECOM_WEBHOOK）不要写在这里，
+#    请在 Cloudflare Dashboard → Worker → Settings → Variables and Secrets 里设为「加密」类型。
+# ⚠️ 若改了本文件后 push，wrangler deploy 会用这里的 [vars] 覆盖 Dashboard 里的同名变量。
+#    所以 CHANNELS / LLM_URL / LLM_MODEL 必须在这里写全，避免被自动删掉。
+[vars]
+CHANNELS = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
+LLM_URL = "https://one.iflytek.com/api/llm/console/chat/v1"
+LLM_MODEL = "claude-opus-5"
