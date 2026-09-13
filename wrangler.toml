@@ -8,7 +8,7 @@ head_sampling_rate = 1
 
 [vars]
 # 监控的 YouTube 频道（channel_id 列表）
-CHANNELS = ["UCkHrq03gWLLx6vjS2DOJ8aA"]
+CHANNELS = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
 
 # Gemini 模型兜底链（2026 年：3.x 系列，按你账号实际可用模型调整）
 # 调用顺序：依次尝试，429/5xx 重试，404/400 立即跳过换下一个
