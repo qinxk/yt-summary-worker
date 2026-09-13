@@ -1,17 +1,19 @@
 // YouTube Digest → Gemini Summary → WeCom Bot Worker
-// 方案 A：不爬字幕，直接把 YouTube 链接交给 Gemini 总结
+//
+// 架构：RSS 拿新视频 → Gemini 直连 YouTube 总结（不爬字幕）→ 企业微信推送
+// Prompt：结构化分段 + 尽量带时间戳 + 自动识别分类
 //
 // 路由：
 //   GET /health             免鉴权
 //   GET /debug/env?token=x  查变量
-//   GET /run-once?token=x   手动触发
+//   GET /run-once?token=x   手动触发（同步、限1个）
 //   GET /?token=x           兼容入口
 //
-// 所需变量（Cloudflare Dashboard / wrangler secret）：
-//   GEMINI_API_KEY  (加密)   Google AI Studio 申请的 key
-//   WECOM_WEBHOOK    (加密)  企业微信机器人 webhook
-//   API_TOKEN        (加密)  手动触发用的 token
-// [vars]（写进 wrangler.toml，明文，非敏感）：
+// 加密变量（wrangler secret put）：
+//   GEMINI_API_KEY  Google AI Studio 申请的 key
+//   WECOM_WEBHOOK   企业微信机器人 webhook
+//   API_TOKEN       手动触发用的 token
+// [vars]（wrangler.toml 明文）：
 //   GEMINI_MODEL = "gemini-2.5-flash"
 //   CHANNELS     = '["UCxxx"]'
 
@@ -19,10 +21,12 @@ const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta';
 
 export default {
   async scheduled(controller, env, ctx) {
-    // Cron 触发：处理全部新视频（Cron 有最长 15 分钟，无 30 秒 waitUntil 限制）
-    ctx.waitUntil(runDigest(env, { limit: Infinity }).then((results) => {
-      console.log('[scheduled] done', JSON.stringify(results));
-    }));
+    // Cron：全量处理（Cron 最长 15 分钟，无 30s waitUntil 限制）
+    ctx.waitUntil(
+      runDigest(env, { limit: Infinity }).then((results) => {
+        console.log('[scheduled] done', JSON.stringify(results));
+      })
+    );
   },
 
   async fetch(request, env, ctx) {
@@ -59,13 +63,12 @@ export default {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // 4) 手动触发：同步跑，且只处理最新 1 个视频
-    //    （避免 waitUntil 30 秒超时把企业微信推送掐断）
+    // 4) 手动触发：同步跑，只处理最新 1 个（避免 30s 超时掐断推送）
     if (path === '/run-once' || path === '/') {
       const results = await runDigest(env, { limit: 1 });
       return Response.json({
         status: 'done',
-        note: '已处理最新 1 个视频（如需全量请等待 Cron 自动触发），查看企业微信 / wrangler tail',
+        note: '已处理最新 1 个视频（全量由 Cron 自动触发），查看企业微信 / wrangler tail',
         results,
       });
     }
@@ -75,9 +78,6 @@ export default {
 };
 
 // ---------- 主流程 ----------
-// opts.limit：本次最多处理的视频数（默认 Infinity，即全量）
-//   - Cron 调用：limit = Infinity，处理全部新视频
-//   - 手动 /run-once：limit = 1，只处理最新 1 个，保证 30 秒内跑完推送
 async function runDigest(env, opts = {}) {
   const limit = opts.limit != null ? opts.limit : Infinity;
   console.log('[runDigest] start, limit:', limit);
@@ -110,27 +110,27 @@ async function runDigest(env, opts = {}) {
         if (v.id === lastId) break;
         newVideos.push(v);
       }
-      // 只处理最新的 limit 个，其余留给下次 Cron
       const todo = newVideos.slice(0, limit);
       console.log('[runDigest] newVideos count:', newVideos.length, 'todo:', todo.length);
 
       for (const video of todo) {
         console.log('[runDigest] summarizing:', video.title);
 
-        // 直接用 YouTube 链接让 Gemini 总结（方案 A）
+        // 串行：逐条总结+推送，避免并发打爆 Gemini 免费层
         let summary = '';
         try {
+          // 方式1：Gemini 直连 YouTube（带 503 指数退避重试）
           summary = await summarizeViaGemini(video, env);
-          console.log('[summarize] ok, length:', summary.length);
+          console.log('[summarize] gemini-direct ok, length:', summary.length);
         } catch (e) {
-          console.error('[summarize] Gemini failed:', e.message);
-          // 降级：标题 + 描述 再让 Gemini 出简版
+          console.error('[summarize] gemini-direct failed:', e.message);
+          // 方式2：标题+描述 降级再试一次
           try {
             summary = await summarizeTextFallback(video, env);
             console.log('[summarize] fallback ok, length:', summary.length);
           } catch (e2) {
             console.error('[summarize] fallback failed:', e2.message);
-            summary = `摘要生成失败：${e.message}`;
+            summary = `⚠️ 今日 Gemini 繁忙，未生成摘要\n标题：${video.title}\n链接：${video.link}`;
           }
         }
 
@@ -141,12 +141,17 @@ async function runDigest(env, opts = {}) {
           console.error('[pushWeCom] failed:', e.message);
         }
 
+        // 节流：两条之间停顿，降低 429/503
+        if (todo.indexOf(video) < todo.length - 1) {
+          await scheduler.wait(800);
+        }
+
         results.push({ title: video.title, status: 'ok' });
       }
 
       if (feed[0]) {
-        // 仅全量（Cron，limit=Infinity）时推进去重标记
-        // 手动触发（limit=1）不更新，保证剩余视频下次 Cron 会继续处理
+        // 仅全量（Cron, limit=Infinity）时推进去重标记
+        // 手动触发（limit=1）不更新，剩余视频留给下次 Cron
         if (limit === Infinity) {
           await env.KV.put(`last:${channelId}`, feed[0].id);
           console.log('[runDigest] updated lastId:', feed[0].id);
@@ -165,73 +170,128 @@ async function runDigest(env, opts = {}) {
   return results;
 }
 
-// ---------- Gemini：YouTube 链接直连总结 ----------
-async function summarizeViaGemini(video, env) {
+// ---------- Gemini：指数退避重试 ----------
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+
+async function geminiGenerate(env, body, attempt = 0, maxRetries = 4) {
   const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
   const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
 
-  const prompt =
-    '请用中文总结这个 YouTube 视频，输出三部分：\n' +
-    '1) 一句话结论；\n' +
-    '2) 3-5 个要点（若视频有时间戳请标注，否则按内容顺序给大致位置区间）；\n' +
-    '3) 值得关注的关键信息。';
-
-  const body = {
-    contents: [
-      {
-        parts: [
-          { text: prompt },
-          { file_data: { file_uri: video.link } },
-        ],
-      },
-    ],
-  };
-
-  console.log('[gemini] request model:', model, 'video:', video.videoId);
-
-  const r = await fetch(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
-  const respText = await r.text();
-  console.log('[gemini] response status:', r.status);
-  console.log('[gemini] response body:', respText.slice(0, 1000));
-
-  if (!r.ok) {
-    throw new Error(`Gemini http ${r.status}: ${respText.slice(0, 500)}`);
+  if (res.ok) {
+    return await res.json();
   }
 
-  const j = JSON.parse(respText);
-  const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
-  if (!text) throw new Error('Gemini returned empty content');
-  return text;
+  const status = res.status;
+  let detail = '';
+  try {
+    detail = (await res.json())?.error?.message || '';
+  } catch {}
+
+  console.warn(`[gemini] http ${status} attempt ${attempt + 1}/${maxRetries + 1}: ${detail}`);
+
+  // 不可重试（key/model 错）或已达上限 → 抛出
+  if (!RETRYABLE.has(status) || attempt >= maxRetries) {
+    const err = new Error(`Gemini http ${status}: ${detail}`);
+    err.status = status;
+    throw err;
+  }
+
+  // 指数退避 + jitter：~1s, ~2s, ~4s, ~8s
+  const base = 1000 * Math.pow(2, attempt);
+  const jitter = Math.floor(Math.random() * 500);
+  const waitMs = Math.min(base + jitter, 15000);
+  console.log(`[gemini] retry after ${waitMs}ms`);
+  await scheduler.wait(waitMs);
+
+  return geminiGenerate(env, body, attempt + 1, maxRetries);
 }
 
-// ---------- Gemini：无链接内容时，用标题+描述降级 ----------
-async function summarizeTextFallback(video, env) {
-  const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
-  const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+// ---------- Prompt：结构化分段 + 时间戳 + 自动分类 ----------
+function buildSummaryPrompt() {
+  return `你是一个专业的视频内容分析师。请对以下 YouTube 视频进行深度总结，输出中文。
 
-  const text =
-    `以下是一段 YouTube 视频的元信息（未能直接读取视频内容），请用中文整理成简版摘要：\n` +
-    `标题：${video.title}\n` +
-    `发布：${video.published}\n` +
-    `描述：${video.description || '无'}\n` +
-    `链接：${video.link}\n\n` +
-    `要求：1)一句话结论；2)3-5个要点；3)关键信息。（开头注明：基于标题与描述整理，未读取视频内容）`;
+## 第一步：自动识别视频分类
+先判断该视频属于哪类内容（财经/经济、社会/时政、科技/互联网、生活/知识、其他），后续总结侧重点随之调整：
+- 财经/经济类：重点标注数字、趋势、影响范围、政策/市场背景
+- 社会/时政类：重点标注时间线、人物关系、法律/政策背景、后续影响
+- 科技/互联网类：重点标注产品/技术细节、对比、行业影响
+- 其他：按内容核心逻辑提取要点
 
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text }] }] }),
+## 第二步：按以下固定格式输出（严格使用 Markdown）
+
+### 📌 一句话结论
+用一句话概括视频核心观点、事件结果或最重要信息。
+
+### 📋 核心要点（3-5 个）
+每个要点按以下结构：
+**要点标题**
+- 详细说明（2-3 句，包含关键数据、人物、因果关系）
+- 时间标记：若该处内容在视频中有明确时间戳，标注 [MM:SS]；若没有则省略不写
+
+> 提示：只有能确定时间戳时才写 [MM:SS]，不要编造时间。无法确认时用"开头/中段/结尾"等相对位置描述。
+
+### 🔍 关键信息 / 值得关注
+列出 2-3 条容易被忽略但重要的细节，例如：
+- 背景信息或前置事件
+- 后续影响或可能的发展
+- 相关方立场或数据来源
+- 不确定性 / 存在争议的部分
+
+### 💬 延伸思考（可选，仅在适用时输出）
+简要说明不同立场的观点分歧，或给观众的实用建议。
+
+## 全局要求
+- 语言：简体中文
+- 不要复述视频标题和链接（消息头部已展示）
+- 不要输出"根据视频内容""以下是总结"等废话前缀，直接给内容
+- 每个区块之间用空行分隔，便于手机阅读
+- 总篇幅控制在 500-900 字
+- 如果视频涉及敏感/争议话题，保持客观中立，不站队`;
+}
+
+// ---------- Gemini：YouTube 链接直连总结 ----------
+async function summarizeViaGemini(video, env) {
+  const data = await geminiGenerate(env, {
+    contents: [
+      {
+        parts: [
+          { text: buildSummaryPrompt() },
+          { file_data: { file_uri: video.link } },
+        ],
+      },
+    ],
   });
 
-  const respText = await r.text();
-  if (!r.ok) throw new Error(`Gemini fallback http ${r.status}: ${respText.slice(0, 500)}`);
-  const j = JSON.parse(respText);
-  return j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+  const text =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+  if (!text) throw new Error('Gemini returned empty content');
+  return text.trim();
+}
+
+// ---------- Gemini：标题+描述 降级总结 ----------
+async function summarizeTextFallback(video, env) {
+  const prompt =
+    buildSummaryPrompt() +
+    `\n\n注意：以下仅提供视频的标题、发布时间、描述等元信息（未能直接读取视频内容），请基于这些信息生成简版摘要，并在"一句话结论"后标注"（基于标题与描述整理，未读取视频内容）"。\n\n` +
+    `视频标题：${video.title}\n` +
+    `发布时间：${video.published}\n` +
+    `视频描述：${video.description || '无'}\n` +
+    `视频链接：${video.link}`;
+
+  const data = await geminiGenerate(env, {
+    contents: [{ parts: [{ text: prompt }] }],
+  });
+
+  const summary =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+  if (!summary) throw new Error('Gemini fallback returned empty content');
+  return summary.trim();
 }
 
 // ---------- 工具 ----------
@@ -252,7 +312,7 @@ function safeParseChannels(raw) {
   }
 }
 
-// ---------- RSS（只拿新视频列表 + 去重，不再爬字幕） ----------
+// ---------- RSS ----------
 async function fetchRSS(channelId) {
   const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
   console.log('[fetchRSS] url:', rssUrl);
@@ -280,16 +340,20 @@ function parseFeed(xml) {
   });
 }
 
-// ---------- 企业微信 ----------
+// ---------- 企业微信推送（结构化排版） ----------
 async function pushWeCom(video, summary, env) {
   const webhook = env.WECOM_WEBHOOK;
   if (!webhook) throw new Error('WECOM_WEBHOOK not set');
 
+  // 结构化排版：标题块 + 分割线 + 摘要正文 + 底部链接
   const content =
-    `## 📺 ${video.title}\n` +
-    `> 发布：${video.published}\n` +
-    `> 链接：${video.link}\n\n` +
-    `**摘要：**\n${summary}`;
+    `## 📺 ${escapeMarkdown(video.title)}\n` +
+    `> 👤 频道：${escapeMarkdown(video.author || '')}\n` +
+    `> 🕐 发布：${formatDate(video.published)}\n` +
+    `\n---\n` +
+    `${summary}\n` +
+    `\n---\n` +
+    `[▶️ 观看原视频](${video.link})`;
 
   const r = await fetch(webhook, {
     method: 'POST',
@@ -302,4 +366,26 @@ async function pushWeCom(video, summary, env) {
     throw new Error(`WeCom push failed: ${JSON.stringify(j)}`);
   }
   return j;
+}
+
+// 转义企业微信 markdown 特殊字符（避免排版错乱）
+function escapeMarkdown(str) {
+  if (!str) return '';
+  return str.replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
+}
+
+// 格式化发布时间为北京时间
+function formatDate(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    const h = String(d.getUTCHours() + 8).padStart(2, '0'); // UTC+8
+    const min = String(d.getUTCMinutes()).padStart(2, '0');
+    return `${y}-${m}-${day} ${h}:${min}`;
+  } catch {
+    return iso;
+  }
 }
