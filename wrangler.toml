@@ -29,5 +29,5 @@ binding = "AI"
 #    所以 CHANNELS / LLM_URL / LLM_MODEL 必须在这里写全，避免被自动删掉。
 [vars]
 CHANNELS = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
-LLM_URL = "https://one.iflytek.com/api/llm/console/chat/v1"
+LLM_URL = "https://one.iflytek.com/api/llm/console/chat"
 LLM_MODEL = "claude-opus-5"
