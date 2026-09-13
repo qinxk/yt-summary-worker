@@ -15,8 +15,9 @@ CHANNELS = "UCkHrq03gWLLx6vjS2DOJ8aA"
 #   调用顺序：依次尝试；429/5xx 重试；400/404/410 立即跳过换下一个
 #   主力放最前（2.5-flash 最稳），3.x 预览放最后（晚高峰易限流）
 #   ⚠️ 若你的 key 对某些模型报 404，直接从下面数组删掉即可
-GEMINI_MODELS = '["gemini-2.5-flash","gemini-2.5-flash-lite","gemini-flash-latest","gemini-3-flash-preview"]'
-GEMINI_MODEL = "gemini-2.5-flash"
+#   ⚠️ gemini-2.5-flash-lite 已对新用户下线（日志实测 404），已移除
+#   部署后用 GET /debug/models?token=xxx 核对账号实际可用清单，别靠猜
+GEMINI_MODELS = '["gemini-2.5-flash","gemini-flash-latest"]'
 
 # 每次触发最多处理的视频数（分批，避免超时；免费层建议 1-3）
 BATCH_SIZE = "3"

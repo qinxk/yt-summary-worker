@@ -30,10 +30,15 @@
 //  加密变量（wrangler secret put）：
 //    GEMINI_API_KEY / WECOM_WEBHOOK / API_TOKEN
 //  [vars]（wrangler.toml 明文）：
-//    CHANNELS / GEMINI_MODELS / GEMINI_MODEL / BATCH_SIZE / THROTTLE_MS
+//    CHANNELS / GEMINI_MODELS / BATCH_SIZE / THROTTLE_MS
+//    INVIDIOUS_HOSTS / TRANSCRIPT_APIS
 
 const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta';
-const REQUEST_TIMEOUT = 15000;      // 单次 Gemini 请求硬超时
+const REQUEST_TIMEOUT = 15000;      // 单次 Gemini 请求硬超时（纯文本）
+// L2 要 Gemini 自己拉取并理解整段视频，15s 结构上不可能完成（实测两个模型都超时）。
+// 单独给宽松超时；预算不足 L2_MIN_BUDGET 时直接跳过 L2，把时间留给 L3。
+const VIDEO_REQUEST_TIMEOUT = 40000;
+const L2_MIN_BUDGET = 25000;
 const TRANSCRIPT_TIMEOUT = 8000;    // 单个字幕源硬超时（原来是裸 fetch，会吃光预算）
 const WECOM_TIMEOUT = 10000;        // 企业微信推送硬超时
 const PER_VIDEO_BUDGET = 55000;     // 单视频总结总预算(ms)，到点直接降级
@@ -96,7 +101,6 @@ export default {
       return Response.json({
         hasKV: !!env.KV,
         hasGeminiKey: !!env.GEMINI_API_KEY,
-        geminiModel: env.GEMINI_MODEL || '(未设置，用链首)',
         models: getModels(env),
         channels: safeParseChannels(env.CHANNELS),
         batchSize: getBatchSize(env),
@@ -112,6 +116,30 @@ export default {
     // 其余接口均需 token
     if (url.searchParams.get('token') !== env.API_TOKEN) {
       return new Response('Unauthorized', { status: 401 });
+    }
+
+    // 查账号实际可用的模型 —— 别靠猜。
+    // 日志里 gemini-2.5-flash-lite 已对新用户下线，用这个接口核对后再改 GEMINI_MODELS。
+    if (path === '/debug/models') {
+      const r = await fetchWithTimeout(`${GEMINI_ENDPOINT}/models`, {
+        timeoutMs: REQUEST_TIMEOUT,
+        headers: { 'x-goog-api-key': env.GEMINI_API_KEY },
+      });
+      const j = await r.json();
+      if (!r.ok) return Response.json({ status: r.status, error: j?.error?.message }, { status: 502 });
+
+      const usable = (j.models || [])
+        .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+        .map((m) => m.name.replace('models/', ''));
+      const configured = getModels(env);
+
+      return Response.json({
+        configured,
+        // 配置了但账号不可用 —— 这些是白烧调用的死条目，从 GEMINI_MODELS 删掉
+        deadInConfig: configured.filter((m) => !usable.includes(m)),
+        usableFlash: usable.filter((m) => /flash/.test(m) && !/thinking|image|audio|tts/.test(m)),
+        usableAll: usable,
+      });
     }
 
     if (path === '/run-once' || path === '/') {
@@ -144,6 +172,7 @@ async function runDigest(env, opts = {}) {
 
   const channels = safeParseChannels(env.CHANNELS);
   const results = [];
+  const run = createRunState();   // 模型黑名单 + 配额标记，本轮所有频道/视频共享
 
   if (!channels.length) {
     console.error('[runDigest] CHANNELS 为空，请在 wrangler.toml 配置');
@@ -151,6 +180,12 @@ async function runDigest(env, opts = {}) {
   }
 
   for (const channelId of channels) {
+    // 配额耗尽：后面的频道也跑不出结果，直接停
+    if (run.quotaExhausted) {
+      results.push({ channel: channelId, status: 'skipped', reason: 'quota exhausted' });
+      continue;
+    }
+
     try {
       const feed = await fetchRSS(channelId);
       console.log('[runDigest] feed count:', feed.length);
@@ -185,13 +220,22 @@ async function runDigest(env, opts = {}) {
       console.log('[runDigest] pending:', pending.length, 'todo:', todo.length);
 
       let processed = 0;
+      let degraded = 0;
       for (const video of todo) {
+        // 配额耗尽后剩余视频不再处理：继续跑只会给每个视频重复一遍
+        // 「429 → 换模型 → 超时」的无效流程，还会推一堆兜底提示。
+        if (run.quotaExhausted) {
+          console.warn('[runDigest] quota exhausted, stop processing remaining videos');
+          results.push({ title: video.title, status: 'skipped', reason: 'quota exhausted' });
+          continue;
+        }
+
         console.log('[runDigest] processing:', video.title);
 
         // 单视频加总预算：超时直接降级，绝不让 Worker 跑到 60s 被取消
         const deadline = Date.now() + PER_VIDEO_BUDGET;
-        const summary = await runWithBudget(
-          () => summarizeWithFallback(video, env, deadline),
+        const result = await runWithBudget(
+          () => summarizeWithFallback(video, env, deadline, run),
           {
             budgetMs: PER_VIDEO_BUDGET,
             fallback: () => buildFallbackMessage(video, '处理超时'),
@@ -199,8 +243,8 @@ async function runDigest(env, opts = {}) {
         );
 
         try {
-          await pushWeCom(video, summary, env);
-          console.log('[pushWeCom] ok');
+          await pushWeCom(video, result.text, env);
+          console.log('[pushWeCom] ok', result.degraded ? '(degraded)' : '');
         } catch (e) {
           // 推送失败不标记已读，下次重试；但不要中断整批
           console.error('[pushWeCom] failed:', e.message);
@@ -208,11 +252,24 @@ async function runDigest(env, opts = {}) {
           continue;
         }
 
-        // 推送成功后才标记，逐个落盘 —— 中途被取消也不会重复推送
-        await saveSeen(env, channelId, seen, [video.id]);
-        seen.add(video.id);
-        processed++;
-        results.push({ title: video.title, status: 'ok' });
+        // 只有拿到真摘要才标记已读。
+        // 兜底提示（配额耗尽/超时/全模型失败）是临时故障，标记了这个视频就
+        // 永远失去摘要机会 —— 留给下次运行重试。
+        if (result.degraded) {
+          degraded++;
+          console.warn('[runDigest] degraded, NOT marking as seen:', video.title);
+          results.push({
+            title: video.title,
+            status: 'degraded',
+            reason: result.reason,
+            willRetry: true,
+          });
+        } else {
+          await saveSeen(env, channelId, seen, [video.id]);
+          seen.add(video.id);
+          processed++;
+          results.push({ title: video.title, status: 'ok' });
+        }
 
         await sleep(getThrottleMs(env));
       }
@@ -221,6 +278,7 @@ async function runDigest(env, opts = {}) {
         channel: channelId,
         status: 'done',
         processed,
+        degraded,
         remaining: pending.length - processed,
       });
     } catch (err) {
@@ -229,6 +287,12 @@ async function runDigest(env, opts = {}) {
     }
   }
 
+  if (run.deadModels.size) {
+    console.log('[runDigest] models blacklisted this run:', JSON.stringify([...run.deadModels]));
+  }
+  if (run.quotaExhausted) {
+    console.error('[runDigest] ABORTED: Gemini 配额耗尽，降级视频未标记已读，下次运行会重试');
+  }
   console.log('[runDigest] finished');
   return results;
 }
@@ -290,21 +354,50 @@ async function runWithBudget(fn, { budgetMs, fallback }) {
   }
 }
 
+// 兜底文案。degraded 标记让上层知道「这不是真摘要」，从而不标记已读。
 function buildFallbackMessage(video, reason = 'Gemini 当前繁忙') {
-  return (
+  const text =
     `⚠️ ${reason}，暂未生成摘要，请直接观看原视频。\n\n` +
-    `标题：${video.title || '（无标题）'}`
+    `标题：${video.title || '（无标题）'}`;
+  return { text, degraded: true, reason };
+}
+
+function buildSummaryResult(text) {
+  return { text, degraded: false };
+}
+
+// ---------- run 级共享状态 ----------
+// 一次运行内所有视频、所有降级层共享。解决日志里暴露的三个浪费：
+//   1. 同一模型在 L2/L3 各报一次 404/429（本轮不可能恢复）
+//   2. 同一模型反复 15s 超时（一次超时说明它这会儿就是慢）
+//   3. 配额耗尽后继续处理剩余视频，每个再烧一遍
+function createRunState() {
+  return {
+    deadModels: new Map(),  // model -> 失效原因
+    quotaExhausted: false,  // 配额型 429：整轮中止
+  };
+}
+
+// 配额耗尽 vs 普通限速：前者等一天，后者等几秒。必须区别对待。
+function isQuotaError(detail) {
+  return /exceeded your current quota|quota exceeded|billing|free tier|per day|daily limit/i.test(
+    detail || ''
   );
 }
 
 // ============================================================
 //  总结（三层兜底）
 // ============================================================
-async function summarizeWithFallback(video, env, deadline = Infinity) {
+async function summarizeWithFallback(video, env, deadline = Infinity, run = null) {
   // 鉴权变量缺失时，三层都会 400/403 空转 → 直接短路
   if (!env.GEMINI_API_KEY) {
     console.error('[summarize] GEMINI_API_KEY 未设置，跳过所有模型调用');
     return buildFallbackMessage(video, '未配置 GEMINI_API_KEY');
+  }
+
+  // 本轮配额已耗尽，直接兜底（不标记已读，配额恢复后会重试）
+  if (run?.quotaExhausted) {
+    return buildFallbackMessage(video, 'API 配额已耗尽');
   }
 
   // L1：字幕优先（纯文本，最稳、最省、最不易 503）
@@ -315,31 +408,42 @@ async function summarizeWithFallback(video, env, deadline = Infinity) {
     // （原来内层 80 / 外层 100 两个阈值不一致，中间区间的字幕会被静默丢弃）
     const transcript = await getTranscript(video.videoId, env, l1Deadline);
     console.log('[summarize] transcript ok, length:', transcript.length);
-    const summary = await summarizeText(transcript, video, env, deadline);
+    const summary = await summarizeText(transcript, video, env, deadline, run);
     console.log('[summarize] layer1(transcript) ok');
-    return summary;
+    return buildSummaryResult(summary);
   } catch (e) {
     console.warn('[summarize] layer1 failed:', e.message);
     if (e.fatal) return buildFallbackMessage(video, 'API key 无效');
+    if (e.quota) return buildFallbackMessage(video, 'API 配额已耗尽');
   }
 
   // L2：Gemini 直连 YouTube（视频理解）
-  try {
-    const summary = await summarizeViaGemini(video, env, deadline);
-    console.log('[summarize] layer2(gemini-direct) ok');
-    return summary;
-  } catch (e) {
-    console.warn('[summarize] layer2 failed:', e.message);
-    if (e.fatal) return buildFallbackMessage(video, 'API key 无效');
+  // 让 Gemini 自己去拉取并理解整段视频，耗时远超纯文本请求 —— 日志里两个模型
+  // 都是 15s 超时。给它单独的宽松超时，否则等于保证失败还白烧 30s 预算。
+  const l2Budget = deadline - Date.now();
+  if (l2Budget < L2_MIN_BUDGET) {
+    console.warn('[summarize] skip layer2, budget too low:', l2Budget, 'ms');
+  } else {
+    try {
+      const summary = await summarizeViaGemini(video, env, deadline, run);
+      console.log('[summarize] layer2(gemini-direct) ok');
+      return buildSummaryResult(summary);
+    } catch (e) {
+      console.warn('[summarize] layer2 failed:', e.message);
+      if (e.fatal) return buildFallbackMessage(video, 'API key 无效');
+      if (e.quota) return buildFallbackMessage(video, 'API 配额已耗尽');
+    }
   }
 
   // L3：标题 + 描述
   try {
-    const summary = await summarizeTextFallback(video, env, deadline);
+    const summary = await summarizeTextFallback(video, env, deadline, run);
     console.log('[summarize] layer3(fallback) ok');
-    return summary;
+    // L3 只看得到元信息，算「基于标题描述整理」的降级摘要，但内容有效 → 标记已读
+    return buildSummaryResult(summary);
   } catch (e) {
     console.error('[summarize] layer3 failed:', e.message);
+    if (e.quota) return buildFallbackMessage(video, 'API 配额已耗尽');
     return buildFallbackMessage(video);
   }
 }
@@ -695,20 +799,43 @@ function cleanText(s) {
 // ============================================================
 
 // 依次尝试链上每个模型；某个模型 404 → 立即换下一个，不重试
-async function callGeminiWithModelChain(env, buildBody, deadline = Infinity) {
+async function callGeminiWithModelChain(
+  env,
+  buildBody,
+  deadline = Infinity,
+  run = null,
+  timeoutMs = REQUEST_TIMEOUT
+) {
   if (!env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not set');
+
+  // 配额已确认耗尽：本轮任何模型都不可能成功，别再发请求
+  if (run?.quotaExhausted) {
+    const err = new Error('quota exhausted for this run');
+    err.quota = true;
+    throw err;
+  }
 
   const models = getModels(env);
   let lastError = '';
+  let attempted = 0;
 
   for (const model of models) {
+    // 本轮已确认失效的模型直接跳过（404 / 配额 / 超时都不会自己恢复）
+    const dead = run?.deadModels.get(model);
+    if (dead) {
+      console.log('[gemini] skip', model, '(dead this run:', dead + ')');
+      lastError = lastError || `${model} dead: ${dead}`;
+      continue;
+    }
+
     // 剩余预算不够发一次请求就别发了，留时间给降级路径
     if (Date.now() + MIN_ATTEMPT_MS > deadline) {
       throw new Error(`budget exhausted before ${model}; last: ${lastError || 'n/a'}`);
     }
 
+    attempted++;
     try {
-      const data = await geminiWithRetry(env, model, buildBody(model), 0, deadline);
+      const data = await geminiWithRetry(env, model, buildBody(model), 0, deadline, timeoutMs);
       console.log('[gemini] model', model, 'ok');
       return data;
     } catch (e) {
@@ -719,23 +846,48 @@ async function callGeminiWithModelChain(env, buildBody, deadline = Infinity) {
       // 必须原样抛出以保留 e.fatal —— 重新包装会让上层三层降级各自再试一遍。
       if (e.fatal) throw e;
 
-      if (e.skipModel) {
-        console.log('[gemini] skip model', model, '(unsupported)');
-        continue; // 400/404/410 → 直接下一个
+      // 配额型 429：整轮中止，剩余视频不再尝试
+      if (e.quota) {
+        if (run) {
+          run.quotaExhausted = true;
+          console.error('[gemini] quota exhausted, aborting this run');
+        }
+        throw e;
       }
-      // 5xx/429 → geminiWithRetry 内部已重试耗尽 → 换模型
+
+      // 404/410/400 或超时：本轮拉黑，L2/L3 及后续视频都不再试
+      if (e.skipModel) {
+        run?.deadModels.set(model, `http error: ${e.message.slice(0, 60)}`);
+        console.log('[gemini] blacklist', model, '(unsupported)');
+        continue;
+      }
+      if (/timeout after/.test(e.message)) {
+        run?.deadModels.set(model, 'timeout');
+        console.log('[gemini] blacklist', model, '(timeout)');
+        continue;
+      }
+      // 限速型 429 / 5xx：可能恢复，不拉黑，换下一个模型
     }
   }
+
+  if (!attempted) throw new Error(`all models dead this run; last: ${lastError}`);
   throw new Error(`all models failed: ${lastError}`);
 }
 
 // 单模型 + 指数退避（仅对 429/5xx）
-async function geminiWithRetry(env, model, body, attempt = 0, deadline = Infinity) {
+async function geminiWithRetry(
+  env,
+  model,
+  body,
+  attempt = 0,
+  deadline = Infinity,
+  maxTimeout = REQUEST_TIMEOUT
+) {
   const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent`;
 
-  // 超时取「固定上限」与「剩余预算」的较小值，避免单次请求越界
+  // 超时取「上限」与「剩余预算」的较小值，避免单次请求越界
   const budgetLeft = deadline - Date.now();
-  const timeoutMs = Math.max(1000, Math.min(REQUEST_TIMEOUT, budgetLeft));
+  const timeoutMs = Math.max(1000, Math.min(maxTimeout, budgetLeft));
 
   const res = await fetchWithTimeout(url, {
     timeoutMs,
@@ -779,6 +931,14 @@ async function geminiWithRetry(env, model, body, attempt = 0, deadline = Infinit
     throw new Error(`Gemini http ${status}: ${detail}`);
   }
 
+  // 429 要分两种：配额耗尽（等一天）vs 瞬时限速（等几秒）。
+  // 配额耗尽时重试和换模型都是纯浪费 —— 免费层配额是账号级、跨模型共享的。
+  if (status === 429 && isQuotaError(detail)) {
+    const err = new Error(`Gemini quota exhausted: ${detail}`);
+    err.quota = true;
+    throw err;
+  }
+
   // 429/5xx：重试耗尽则抛（交给模型链换下一个）
   if (attempt >= MAX_RETRIES) {
     throw new Error(`Gemini retry exhausted: ${status} ${detail}`);
@@ -794,11 +954,11 @@ async function geminiWithRetry(env, model, body, attempt = 0, deadline = Infinit
 
   console.log(`[gemini] retry after ${wait}ms`);
   await sleep(wait);
-  return geminiWithRetry(env, model, body, attempt + 1, deadline);
+  return geminiWithRetry(env, model, body, attempt + 1, deadline, maxTimeout);
 }
 
 // ---- L1：纯文本（字幕）总结 ----
-async function summarizeText(text, video, env, deadline) {
+async function summarizeText(text, video, env, deadline, run) {
   const prompt =
     buildSummaryPrompt({ hasTimestamps: /\[\d+:\d{2}/.test(text) }) +
     `\n\n以下是视频的字幕内容（[MM:SS] 为该段的真实时间戳），请据此总结：\n\n${text}` +
@@ -806,13 +966,14 @@ async function summarizeText(text, video, env, deadline) {
   const data = await callGeminiWithModelChain(
     env,
     () => ({ contents: [{ parts: [{ text: prompt }] }] }),
-    deadline
+    deadline,
+    run
   );
   return extractText(data);
 }
 
 // ---- L2：Gemini 直连 YouTube ----
-async function summarizeViaGemini(video, env, deadline) {
+async function summarizeViaGemini(video, env, deadline, run) {
   const data = await callGeminiWithModelChain(
     env,
     () => ({
@@ -825,13 +986,15 @@ async function summarizeViaGemini(video, env, deadline) {
         },
       ],
     }),
-    deadline
+    deadline,
+    run,
+    VIDEO_REQUEST_TIMEOUT   // 视频理解用宽松超时
   );
   return extractText(data);
 }
 
 // ---- L3：仅标题 + 描述 ----
-async function summarizeTextFallback(video, env, deadline) {
+async function summarizeTextFallback(video, env, deadline, run) {
   const title = video.title?.trim() || '未知标题';
   const description = video.description?.trim() || '';
   const published = video.published || '未知时间';
@@ -839,7 +1002,7 @@ async function summarizeTextFallback(video, env, deadline) {
 
   // 连标题都没有，直接发简版，不浪费调用
   if (title === '未知标题' && !description) {
-    return buildFallbackMessage(video, '未获取到视频内容');
+    throw new Error('no metadata to summarize');
   }
 
   const prompt =
@@ -850,7 +1013,8 @@ async function summarizeTextFallback(video, env, deadline) {
   const data = await callGeminiWithModelChain(
     env,
     () => ({ contents: [{ parts: [{ text: prompt }] }] }),
-    deadline
+    deadline,
+    run
   );
   return extractText(data);
 }
