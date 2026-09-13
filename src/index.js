@@ -190,13 +190,15 @@ function parseFeed(xml) {
 
 // ---------- 字幕 ----------
 async function getTranscript(videoId) {
+  // 方案1：使用 youtube-captions 的公开接口
   const res = await fetch(
-    `https://youtube-transcript.ai/transcript/${videoId}.txt?lang=zh-Hans,zh,en`,
+    `https://youtube-captions-api.vercel.app/api/captions?videoId=${videoId}&lang=zh-Hans,zh,en`,
     { headers: { 'User-Agent': 'Mozilla/5.0' } }
   );
   if (!res.ok) throw new Error(`transcript fetch failed: ${res.status}`);
-  const text = await res.text();
-  return text.split('\n').slice(0, 80).join(' ').slice(0, 12000);
+  const data = await res.json();
+  if (data.transcript) return data.transcript.slice(0, 12000);
+  throw new Error('no transcript in response');
 }
 
 // ---------- LLM 总结 ----------
