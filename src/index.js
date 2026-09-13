@@ -1,22 +1,20 @@
 // YouTube Digest → LLM Summary → WeCom Bot Worker
-// 部署：Cloudflare Workers + KV，Cron Trigger 每日触发
-//
 // 路由：
-//   GET /health             免鉴权健康检查（用于确认 Worker 是否在线）
-//   GET /debug/env          需 Token，打印环境变量绑定情况（不暴露密钥明文）
-//   GET /run-once?token=xxx 需 Token，手动触发一次 digest
-//   GET /?token=xxx         同上，兼容旧入口
+//   GET /health             免鉴权
+//   GET /debug/env?token=x  查变量
+//   GET /run-once?token=x   手动触发
+//   GET /?token=x           兼容入口
 
 export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runDigest(env));
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 1) 健康检查：免鉴权
+    // 1) 健康检查
     if (path === '/health') {
       return Response.json({
         status: 'ok',
@@ -26,7 +24,7 @@ export default {
       });
     }
 
-    // 2) 环境变量自查：需 Token（不打印密钥明文）
+    // 2) 变量自查
     if (path === '/debug/env') {
       if (url.searchParams.get('token') !== env.API_TOKEN) {
         return new Response('Unauthorized', { status: 401 });
@@ -39,26 +37,26 @@ export default {
         llmModel: env.LLM_MODEL || null,
         channels: safeParseChannels(env.CHANNELS),
         hasWeCom: !!env.WECOM_WEBHOOK,
+        hasAPIToken: !!env.API_TOKEN,
       });
     }
 
-    // 3) 其余所有请求必须带有效 token
+    // 3) Token 校验
     if (url.searchParams.get('token') !== env.API_TOKEN) {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // 4) 手动触发 digest
+    // 4) 手动触发
     if (path === '/run-once' || path === '/') {
-      // 用 waitUntil 让请求立即返回，任务在后台跑
-      const task = runDigest(env).then((results) => {
-        // 结果仅记录到日志，不直接阻塞响应
-        console.log('[runDigest] done', JSON.stringify(results));
-      });
-      // 如果 env 支持 ctx，用 waitUntil；这里通过 Promise 简单处理
-      return new Response(
-        JSON.stringify({ status: 'triggered', note: '任务已在后台执行，稍后查看企业微信 / Worker 日志' }),
-        { headers: { 'Content-Type': 'application/json' } }
+      ctx.waitUntil(
+        runDigest(env).then((results) => {
+          console.log('[runDigest] done', JSON.stringify(results));
+        })
       );
+      return Response.json({
+        status: 'triggered',
+        note: '任务已在后台执行，查看企业微信 / wrangler tail',
+      });
     }
 
     return new Response('Not Found', { status: 404 });
@@ -67,60 +65,87 @@ export default {
 
 // ---------- 主流程 ----------
 async function runDigest(env) {
+  console.log('[runDigest] start');
   const channels = safeParseChannels(env.CHANNELS);
   const results = [];
 
   if (!channels.length) {
-    console.warn('[runDigest] CHANNELS 为空，请检查 wrangler.toml 或 Dashboard 变量');
+    console.error('[runDigest] CHANNELS 为空');
     return [{ status: 'error', error: 'CHANNELS 为空' }];
   }
 
+  console.log('[runDigest] channels:', JSON.stringify(channels));
+
   for (const channelId of channels) {
     try {
-      // 1. 抓取频道 RSS
+      console.log('[runDigest] processing channel:', channelId);
+
+      // 1. RSS
       const feed = await fetchRSS(channelId);
+      console.log('[runDigest] feed count:', feed.length);
       if (!feed.length) {
         results.push({ channel: channelId, status: 'noop', reason: 'feed 为空' });
         continue;
       }
 
-      // 2. 从 KV 取上次处理到的最新 videoId
+      // 2. KV 去重
       const lastId = await env.KV.get(`last:${channelId}`);
+      console.log('[runDigest] lastId:', lastId);
       const newVideos = [];
       for (const v of feed) {
-        if (v.id === lastId) break; // 已处理过，之后的都是旧的
+        if (v.id === lastId) break;
         newVideos.push(v);
       }
+      console.log('[runDigest] newVideos count:', newVideos.length);
 
       for (const video of newVideos) {
-        // 3. 提取字幕
+        console.log('[runDigest] summarizing:', video.title);
+
+        // 3. 字幕
         let transcript = '';
         try {
           transcript = await getTranscript(video.videoId);
+          console.log('[transcript] ok, length:', transcript.length);
         } catch (e) {
-          console.warn('[transcript] 失败，降级用描述', video.videoId, e.message);
+          console.warn('[transcript] failed, fallback to description:', e.message);
           transcript = video.description || '';
         }
 
-        // 4. LLM 总结（Workers AI 优先，LLM_URL 兜底）
-        const summary = transcript
-          ? await summarize(transcript, env)
-          : '（该视频无字幕，无法生成摘要）';
+        // 4. 总结
+        let summary = '';
+        try {
+          summary = await summarize(transcript, env);
+          console.log('[summarize] ok, length:', summary.length);
+        } catch (e) {
+          console.error('[summarize] failed:', e.message);
+          summary = `摘要生成失败: ${e.message}`;
+        }
 
-        // 5. 推送到企业微信
-        await pushWeCom(video, summary, env);
+        // 5. 推送
+        try {
+          await pushWeCom(video, summary, env);
+          console.log('[pushWeCom] ok');
+        } catch (e) {
+          console.error('[pushWeCom] failed:', e.message);
+        }
 
         results.push({ title: video.title, status: 'ok' });
       }
 
-      // 6. 更新 KV 为最新一条（去重）
-      await env.KV.put(`last:${channelId}`, feed[0].id);
+      // 6. 更新去重标记
+      if (feed[0]) {
+        await env.KV.put(`last:${channelId}`, feed[0].id);
+        console.log('[runDigest] updated lastId:', feed[0].id);
+      }
+
       results.push({ channel: channelId, status: 'done', processed: newVideos.length });
     } catch (err) {
-      console.error('[runDigest] channel error', channelId, err.message);
+      console.error('[runDigest] channel error:', channelId, err.message);
       results.push({ channel: channelId, status: 'error', error: err.message });
     }
   }
+
+  console.log('[runDigest] finished, results:', JSON.stringify(results));
   return results;
 }
 
@@ -131,14 +156,15 @@ function safeParseChannels(raw) {
     const arr = JSON.parse(raw);
     return Array.isArray(arr) ? arr : [];
   } catch (e) {
-    console.error('[CHANNELS] 解析失败，值应为 JSON 数组字符串', raw);
+    console.error('[CHANNELS] parse failed:', raw);
     return [];
   }
 }
 
-// ---------- RSS 抓取 ----------
+// ---------- RSS ----------
 async function fetchRSS(channelId) {
   const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+  console.log('[fetchRSS] url:', rssUrl);
   const res = await fetch(rssUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
   if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
   const xml = await res.text();
@@ -162,14 +188,13 @@ function parseFeed(xml) {
   });
 }
 
-// ---------- 字幕提取 ----------
+// ---------- 字幕 ----------
 async function getTranscript(videoId) {
-  // 第三方免 key 字幕接口；失败时上层会降级用 description
   const res = await fetch(
     `https://youtube-transcript.ai/transcript/${videoId}.txt?lang=zh-Hans,zh,en`,
     { headers: { 'User-Agent': 'Mozilla/5.0' } }
   );
-  if (!res.ok) throw new Error('no transcript');
+  if (!res.ok) throw new Error(`transcript fetch failed: ${res.status}`);
   const text = await res.text();
   return text.split('\n').slice(0, 80).join(' ').slice(0, 12000);
 }
@@ -178,19 +203,23 @@ async function getTranscript(videoId) {
 async function summarize(transcript, env) {
   const prompt = `请用中文把以下 YouTube 视频字幕整理成摘要，输出：1)一句话结论；2)3-5个要点（带大致时间）；3)值得关注的关键信息。\n\n字幕：\n${transcript}`;
 
-  // 方式A：Workers AI（同平台，无网络限制，推荐）
+  // 方式A：Workers AI
   if (env.AI) {
     try {
       const { text } = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', { prompt });
       if (text) return text;
     } catch (e) {
-      console.warn('[summarize] Workers AI 失败，降级', e.message);
+      console.warn('[summarize] Workers AI failed, fallback:', e.message);
     }
   }
 
-  // 方式B：兼容 OpenAI 的接口（env.LLM_URL / LLM_KEY）
+  // 方式B：中转站 / OpenAI 兼容接口
   if (env.LLM_URL) {
-    const r = await fetch(`${env.LLM_URL}/chat/completions`, {
+    const url = `${env.LLM_URL}/chat/completions`;
+    console.log('[summarize] LLM request to:', url);
+    console.log('[summarize] model:', env.LLM_MODEL);
+
+    const r = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -202,34 +231,35 @@ async function summarize(transcript, env) {
         max_tokens: 800,
       }),
     });
+
+    const respText = await r.text();
+    console.log('[summarize] LLM response status:', r.status);
+    console.log('[summarize] LLM response body:', respText);
+
     if (!r.ok) {
-      const errText = await r.text();
-      throw new Error(`LLM http ${r.status}: ${errText}`);
+      throw new Error(`LLM http ${r.status}: ${respText}`);
     }
-    const j = await r.json();
+
+    const j = JSON.parse(respText);
     return j.choices?.[0]?.message?.content || '';
   }
 
-  // 兜底：无模型时返回字幕前 500 字
   return transcript.slice(0, 500);
 }
 
-// ---------- 企业微信推送 ----------
+// ---------- 企业微信 ----------
 async function pushWeCom(video, summary, env) {
-  const webhook = env.WECOM_WEBHOOK; // https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+  const webhook = env.WECOM_WEBHOOK;
   if (!webhook) throw new Error('WECOM_WEBHOOK not set');
-  const content = `## 📺 ${video.title}
-> 发布：${video.published}
-> 链接：${video.link}
 
-**摘要：**
-${summary}`;
+  const content = `## 📺 ${video.title}\n> 发布：${video.published}\n> 链接：${video.link}\n\n**摘要：**\n${summary}`;
 
   const r = await fetch(webhook, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ msgtype: 'markdown', markdown: { content } }),
   });
+
   const j = await r.json();
   if (j.errcode && j.errcode !== 0) {
     throw new Error(`WeCom push failed: ${JSON.stringify(j)}`);
