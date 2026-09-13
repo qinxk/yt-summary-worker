@@ -1,33 +1,21 @@
 name = "yt-summary-worker"
 main = "src/index.js"
-compatibility_date = "2026-09-01"
-# 关联 GitHub 部署：Cloudflare Dashboard → Workers → 你的 Worker → Settings → Integrations → Connect GitHub
-# 或使用 GitHub Actions：见 .github/workflows/deploy.yml
+compatibility_date = "2024-09-01"
 
-# Cron 定时：每日 UTC 23:00 = 北京时间次日 07:00
-# 改时间：https://crontab.guru/  (注意 Cloudflare 用 UTC)
-[triggers]
-crons = ["0 23 * * *"]
+[observability]
+enabled = true
+head_sampling_rate = 1
 
-# 启用 workers.dev 默认域名（如不需要可设为 false，改用自定义域）
-workers_dev = true
+[vars]
+CHANNELS     = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
+GEMINI_MODEL = "gemini-2.5-flash"
+SUMMARY_PROVIDER = "gemini"
 
-# KV 命名空间（先执行：wrangler kv:namespace create YTKV）
-# 把 id 换成你在 Cloudflare Dashboard 实际创建的命名空间 ID
 [[kv_namespaces]]
 binding = "KV"
-id = "178d6588564149eb8b80d92d8d51386d"
+id = "178d6588564149eb8b80d92d8d51386d"   # ← 换成你真实的 KV 命名空间 ID
 
-# Workers AI 绑定（如使用 Workers AI 做总结，免费额度充足）
-[ai]
-binding = "AI"
-
-# ---------- 非敏感变量（写在这里，wrangler deploy 时会一起部署，不会被清空）----------
-# ⚠️ 敏感信息（API_TOKEN / LLM_KEY / WECOM_WEBHOOK）不要写在这里，
-#    请在 Cloudflare Dashboard → Worker → Settings → Variables and Secrets 里设为「加密」类型。
-# ⚠️ 若改了本文件后 push，wrangler deploy 会用这里的 [vars] 覆盖 Dashboard 里的同名变量。
-#    所以 CHANNELS / LLM_URL / LLM_MODEL 必须在这里写全，避免被自动删掉。
-[vars]
-CHANNELS = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
-LLM_URL = "https://one.iflytek.com/api/llm/console/chat/v1"
-LLM_MODEL = "claude-opus-5"
+# 敏感变量请用 wrangler secret 设置（不要写进 toml）：
+#   npx wrangler secret put GEMINI_API_KEY
+#   npx wrangler secret put API_TOKEN
+#   npx wrangler secret put WECOM_WEBHOOK

@@ -1,9 +1,21 @@
-// YouTube Digest → LLM Summary → WeCom Bot Worker
+// YouTube Digest → Gemini Summary → WeCom Bot Worker
+// 方案 A：不爬字幕，直接把 YouTube 链接交给 Gemini 总结
+//
 // 路由：
 //   GET /health             免鉴权
 //   GET /debug/env?token=x  查变量
 //   GET /run-once?token=x   手动触发
 //   GET /?token=x           兼容入口
+//
+// 所需变量（Cloudflare Dashboard / wrangler secret）：
+//   GEMINI_API_KEY  (加密)   Google AI Studio 申请的 key
+//   WECOM_WEBHOOK    (加密)  企业微信机器人 webhook
+//   API_TOKEN        (加密)  手动触发用的 token
+// [vars]（写进 wrangler.toml，明文，非敏感）：
+//   GEMINI_MODEL = "gemini-2.5-flash"
+//   CHANNELS     = '["UCxxx"]'
+
+const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta';
 
 export default {
   async scheduled(controller, env, ctx) {
@@ -20,21 +32,19 @@ export default {
         status: 'ok',
         time: new Date().toISOString(),
         kv: !!env.KV,
-        ai: !!env.AI,
+        model: env.GEMINI_MODEL || null,
       });
     }
 
-    // 2) 变量自查
+    // 2) 变量自查（不暴露密钥明文）
     if (path === '/debug/env') {
       if (url.searchParams.get('token') !== env.API_TOKEN) {
         return new Response('Unauthorized', { status: 401 });
       }
       return Response.json({
         hasKV: !!env.KV,
-        hasAI: !!env.AI,
-        hasLLMKey: !!env.LLM_KEY,
-        llmUrl: env.LLM_URL || null,
-        llmModel: env.LLM_MODEL || null,
+        hasGeminiKey: !!env.GEMINI_API_KEY,
+        geminiModel: env.GEMINI_MODEL || null,
         channels: safeParseChannels(env.CHANNELS),
         hasWeCom: !!env.WECOM_WEBHOOK,
         hasAPIToken: !!env.API_TOKEN,
@@ -46,7 +56,7 @@ export default {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // 4) 手动触发（用 ctx.waitUntil 保证后台任务跑完、日志完整）
+    // 4) 手动触发（ctx.waitUntil 保证后台跑完、日志完整）
     if (path === '/run-once' || path === '/') {
       ctx.waitUntil(
         runDigest(env).then((results) => {
@@ -66,6 +76,8 @@ export default {
 // ---------- 主流程 ----------
 async function runDigest(env) {
   console.log('[runDigest] start');
+  ensureConfig(env);
+
   const channels = safeParseChannels(env.CHANNELS);
   const results = [];
 
@@ -98,45 +110,31 @@ async function runDigest(env) {
       for (const video of newVideos) {
         console.log('[runDigest] summarizing:', video.title);
 
-        // 1) 多源轮询拿字幕
-        let transcript = await getTranscriptWithFallback(video.videoId);
-        console.log('[transcript] final length:', transcript.length);
-
-        // 2) 字幕太短/无效 → 用标题+描述兜底，并标注原因
-        let noSubtitle = false;
-        if (transcript.trim().length < 30) {
-          noSubtitle = true;
-          transcript =
-            `标题：${video.title}\n` +
-            `发布：${video.published}\n` +
-            `描述：${video.description || '无'}\n` +
-            `（说明：未获取到字幕，以下基于标题与描述生成）`;
-        }
-
-        // 3. 组装给 LLM 的正文
-        const body = noSubtitle
-          ? transcript
-          : `视频标题：${video.title}\n\n字幕：\n${transcript}`;
-
+        // 直接用 YouTube 链接让 Gemini 总结（方案 A）
         let summary = '';
         try {
-          summary = await summarize(body, env);
+          summary = await summarizeViaGemini(video, env);
           console.log('[summarize] ok, length:', summary.length);
         } catch (e) {
-          console.error('[summarize] failed:', e.message);
-          summary = `摘要生成失败: ${e.message}`;
+          console.error('[summarize] Gemini failed:', e.message);
+          // 降级：标题 + 描述 再让 Gemini 出简版
+          try {
+            summary = await summarizeTextFallback(video, env);
+            console.log('[summarize] fallback ok, length:', summary.length);
+          } catch (e2) {
+            console.error('[summarize] fallback failed:', e2.message);
+            summary = `摘要生成失败：${e.message}`;
+          }
         }
 
-        // 4. 推送（无字幕时在开头注明）
-        const prefix = noSubtitle ? '⚠️ 该视频无可用字幕，以下基于标题/描述整理\n\n' : '';
         try {
-          await pushWeCom(video, prefix + summary, env);
+          await pushWeCom(video, summary, env);
           console.log('[pushWeCom] ok');
         } catch (e) {
           console.error('[pushWeCom] failed:', e.message);
         }
 
-        results.push({ title: video.title, status: 'ok', noSubtitle });
+        results.push({ title: video.title, status: 'ok' });
       }
 
       if (feed[0]) {
@@ -154,91 +152,82 @@ async function runDigest(env) {
   return results;
 }
 
-// ---------- 字幕：多源轮询 + 兜底 ----------
-async function getTranscriptWithFallback(videoId) {
-  // 每个 source 返回字幕文本（纯字符串），失败抛错
-  const sources = [
-    // 源1：原 youtube-transcript.ai
-    async () => {
-      const res = await fetch(
-        `https://youtube-transcript.ai/transcript/${videoId}.txt?lang=zh-Hans,zh,en`,
-        { headers: { 'User-Agent': 'Mozilla/5.0' } }
-      );
-      if (!res.ok) throw new Error(`src1 status ${res.status}`);
-      const text = await res.text();
-      // 若返回的是“限流提示页”，当无效处理
-      if (/高频调用|速率|rate limit|请联系|联系我/i.test(text)) {
-        throw new Error('src1 returned limit page');
-      }
-      return text;
-    },
-    // 源2：vercel 中转
-    async () => {
-      const res = await fetch(
-        `https://youtube-captions-api.vercel.app/api/captions?videoId=${videoId}&lang=zh-Hans,zh,en`,
-        { headers: { 'User-Agent': 'Mozilla/5.0' } }
-      );
-      if (!res.ok) throw new Error(`src2 status ${res.status}`);
-      const data = await res.json();
-      const t = data && (data.transcript || data.text || '');
-      if (!t) throw new Error('src2 empty');
-      return typeof t === 'string' ? t : JSON.stringify(t);
-    },
-    // 源3：Invidious 实例轮询
-    async () => {
-      const instances = [
-        'https://invidious.io.lol',
-        'https://yewtu.be',
-        'https://invidious.privacydev.net',
-      ];
-      let lastErr = '';
-      for (const base of instances) {
-        try {
-          const res = await fetch(
-            `${base}/api/v1/captions/${videoId}?lang=zh-Hans,zh,en`,
-            { headers: { 'User-Agent': 'Mozilla/5.0' } }
-          );
-          if (!res.ok) {
-            lastErr = `src3 ${base} status ${res.status}`;
-            continue;
-          }
-          const list = await res.json();
-          if (!Array.isArray(list) || !list.length) {
-            lastErr = `src3 ${base} empty`;
-            continue;
-          }
-          // 不同实例字段可能不同：text / content
-          return list
-            .map((s) => s.text || s.content || '')
-            .join(' ')
-            .trim();
-        } catch (e) {
-          lastErr = `src3 ${base}: ${e.message}`;
-          continue;
-        }
-      }
-      throw new Error(lastErr || 'src3 all failed');
-    },
-  ];
+// ---------- Gemini：YouTube 链接直连总结 ----------
+async function summarizeViaGemini(video, env) {
+  const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
 
-  for (let i = 0; i < sources.length; i++) {
-    try {
-      const text = await sources[i]();
-      if (text && text.trim().length >= 30) {
-        console.log(`[transcript] source ${i + 1} ok`);
-        return text.trim().slice(0, 12000);
-      }
-      console.warn(`[transcript] source ${i + 1} too short`);
-    } catch (e) {
-      console.warn(`[transcript] source ${i + 1} failed:`, e.message);
-    }
+  const prompt =
+    '请用中文总结这个 YouTube 视频，输出三部分：\n' +
+    '1) 一句话结论；\n' +
+    '2) 3-5 个要点（若视频有时间戳请标注，否则按内容顺序给大致位置区间）；\n' +
+    '3) 值得关注的关键信息。';
+
+  const body = {
+    contents: [
+      {
+        parts: [
+          { text: prompt },
+          { file_data: { file_uri: video.link } },
+        ],
+      },
+    ],
+  };
+
+  console.log('[gemini] request model:', model, 'video:', video.videoId);
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  const respText = await r.text();
+  console.log('[gemini] response status:', r.status);
+  console.log('[gemini] response body:', respText.slice(0, 1000));
+
+  if (!r.ok) {
+    throw new Error(`Gemini http ${r.status}: ${respText.slice(0, 500)}`);
   }
 
-  // 所有源都失败 → 返回空，由上层用标题+描述兜底
-  return '';
+  const j = JSON.parse(respText);
+  const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+  if (!text) throw new Error('Gemini returned empty content');
+  return text;
+}
+
+// ---------- Gemini：无链接内容时，用标题+描述降级 ----------
+async function summarizeTextFallback(video, env) {
+  const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+
+  const text =
+    `以下是一段 YouTube 视频的元信息（未能直接读取视频内容），请用中文整理成简版摘要：\n` +
+    `标题：${video.title}\n` +
+    `发布：${video.published}\n` +
+    `描述：${video.description || '无'}\n` +
+    `链接：${video.link}\n\n` +
+    `要求：1)一句话结论；2)3-5个要点；3)关键信息。（开头注明：基于标题与描述整理，未读取视频内容）`;
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text }] }] }),
+  });
+
+  const respText = await r.text();
+  if (!r.ok) throw new Error(`Gemini fallback http ${r.status}: ${respText.slice(0, 500)}`);
+  const j = JSON.parse(respText);
+  return j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
 }
 
 // ---------- 工具 ----------
+function ensureConfig(env) {
+  if (!env.GEMINI_API_KEY) console.error('[config] GEMINI_API_KEY 未设置');
+  if (!env.WECOM_WEBHOOK) console.error('[config] WECOM_WEBHOOK 未设置');
+  if (!env.API_TOKEN) console.error('[config] API_TOKEN 未设置');
+}
+
 function safeParseChannels(raw) {
   if (!raw) return [];
   try {
@@ -250,7 +239,7 @@ function safeParseChannels(raw) {
   }
 }
 
-// ---------- RSS ----------
+// ---------- RSS（只拿新视频列表 + 去重，不再爬字幕） ----------
 async function fetchRSS(channelId) {
   const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
   console.log('[fetchRSS] url:', rssUrl);
@@ -276,55 +265,6 @@ function parseFeed(xml) {
       link,
     };
   });
-}
-
-// ---------- LLM 总结 ----------
-async function summarize(transcript, env) {
-  const prompt = `请用中文把以下 YouTube 视频内容整理成摘要，输出：1)一句话结论；2)3-5个要点（若内容带时间戳请标注，否则按内容顺序给大致位置区间）；3)值得关注的关键信息。\n\n${transcript}`;
-
-  // 方式A：Workers AI
-  if (env.AI) {
-    try {
-      const { text } = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', { prompt });
-      if (text) return text;
-    } catch (e) {
-      console.warn('[summarize] Workers AI failed, fallback:', e.message);
-    }
-  }
-
-  // 方式B：中转站 / OpenAI 兼容接口
-  if (env.LLM_URL) {
-    const url = `${env.LLM_URL}/chat/completions`;
-    console.log('[summarize] LLM request to:', url);
-    console.log('[summarize] model:', env.LLM_MODEL);
-
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${env.LLM_KEY}`,
-      },
-      body: JSON.stringify({
-        model: env.LLM_MODEL || 'gpt-4o-mini',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 800,
-      }),
-    });
-
-    const respText = await r.text();
-    console.log('[summarize] LLM response status:', r.status);
-    console.log('[summarize] LLM response body:', respText);
-
-    if (!r.ok) {
-      throw new Error(`LLM http ${r.status}: ${respText}`);
-    }
-
-    const j = JSON.parse(respText);
-    return j.choices?.[0]?.message?.content || '';
-  }
-
-  // 兜底：无模型时用字幕/描述前 500 字
-  return transcript.slice(0, 500);
 }
 
 // ---------- 企业微信 ----------
