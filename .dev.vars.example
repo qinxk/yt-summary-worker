@@ -1,0 +1,19 @@
+# 复制为 .dev.vars（本地）/ 在 Cloudflare Dashboard → Settings → Variables 配置（生产）
+# 敏感项务必点「Encrypt」加密
+
+# 手动触发的访问令牌（GET /?token=xxx）
+API_TOKEN=your_random_secret_token
+
+# 监控的频道 Channel ID 列表（JSON 数组，UC 开头）
+# 获取方式：频道页 → 查看源代码 → 搜索 "channelId"
+CHANNELS=["UCxxxxxxxxxxxxxxxxxxxx","UCyyyyyyyyyyyyyyyyyyyy"]
+
+# 企业微信群机器人 Webhook（推荐，无需 access_token / 固定 IP）
+WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+# ===== 以下二选一：总结用的 LLM =====
+# 方式A：Workers AI → 无需下面变量，只需 wrangler.toml 里 [ai] binding（推荐）
+# 方式B：OpenAI 兼容接口
+LLM_URL=https://api.openai.com/v1/chat/completions
+LLM_KEY=sk-xxxxxxxx
+LLM_MODEL=gpt-4o-mini

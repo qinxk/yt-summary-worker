@@ -1,0 +1,19 @@
+name = "yt-summary-worker"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+# 关联 GitHub 部署：Cloudflare Dashboard → Workers → 你的 Worker → Settings → Integrations → Connect GitHub
+# 或使用 GitHub Actions：见 .github/workflows/deploy.yml
+
+# Cron 定时：每日 UTC 23:00 = 北京时间次日 07:00
+# 改时间：https://crontab.guru/  (注意 Cloudflare 用 UTC)
+[triggers]
+crons = ["0 23 * * *"]
+
+# KV 命名空间（先执行：wrangler kv:namespace create YTKV）
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# Workers AI 绑定（如使用 Workers AI 做总结，免费额度充足）
+[ai]
+binding = "AI"
