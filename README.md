@@ -3,10 +3,37 @@
 YouTube 频道新视频监控 → Gemini 总结 → 企业微信推送（Cloudflare Worker）
 
 ## 功能
-- 定时 / 手动抓取 YouTube 频道 RSS，识别新视频（KV 去重）
+- 定时 / 手动抓取 YouTube 频道 RSS，识别新视频（KV 去重，按已处理 ID 集合）
 - **字幕优先 → Gemini 直连 → 标题+描述**，三层兜底
 - Gemini 模型链（2.5-flash 主力 + 3.x 预览兜底）+ 指数退避 + 单视频超时预算（绝不卡死 Worker）
-- 结构化摘要推送到企业微信机器人
+- 结构化摘要推送到企业微信机器人（自动按 4096 字节上限截断）
+
+## 字幕获取
+
+按顺序尝试，任一成功即停：
+
+| 优先级 | 源 | 说明 |
+|--------|-----|------|
+| 1 | YouTube 官方 `timedtext` | 无需第三方，依次试 zh-Hans / zh / en + 自动字幕(asr) |
+| 2 | Invidious 实例 | 先取字幕清单，再按语言优先级下载 VTT，用 `INVIDIOUS_HOSTS` 配置 |
+| 3 | 自定义 API | `TRANSCRIPT_APIS`，`{id}` 替换为 videoId |
+
+支持 **WebVTT / timedtext XML / JSON** 三种返回格式（按内容嗅探，不假定 JSON）。
+字幕带 `[MM:SS]` 时间戳一起喂给模型，摘要里的时间标记是真实的而非编造。
+
+全部字幕源失败时自动降级到 Gemini 直连视频，再失败则用标题+描述，绝不静默跳过。
+
+### 字幕拿不到怎么办
+1. `wrangler tail` 看日志里每个源的失败原因
+2. 公共 Invidious 实例经常挂，从 `INVIDIOUS_HOSTS` 里换掉失效的
+3. 视频本身没字幕（未开自动字幕）→ 会走 Gemini 直连，属正常降级
+4. 想要更稳可自建字幕服务，填到 `TRANSCRIPT_APIS`
+
+## 本地测试
+```bash
+node test-local.js   # 解析逻辑单测（VTT/XML/实体/时区/截断）
+node test-flow.js    # 端到端流程（mock fetch + KV，含降级与幂等）
+```
 
 ## 部署
 

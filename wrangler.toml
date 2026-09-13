@@ -24,6 +24,13 @@ BATCH_SIZE = "3"
 # 每条视频之间的节流间隔（毫秒），避免打爆免费层 RPM
 THROTTLE_MS = "2000"
 
+# ===== 字幕兜底源 =====
+#   字幕优先级：YouTube 官方 timedtext（代码内置，无需配置）→ Invidious → 自定义 API
+#   公共 Invidious 实例存活率不稳，实例挂了就从下面数组里换掉
+INVIDIOUS_HOSTS = '["https://invidious.privacydev.net","https://yewtu.be","https://invidious.io.lol"]'
+#   自定义字幕 API：{id} 会被替换为 videoId；支持 JSON / WebVTT / XML 返回。没有就留 []
+TRANSCRIPT_APIS = '[]'
+
 # Cron：每天 UTC 22:00 = 北京时间 06:00（避开晚高峰，容量充裕）
 #   如需改时间，调整此处即可（按需取消注释切换）
 [triggers]
