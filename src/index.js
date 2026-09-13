@@ -107,6 +107,13 @@ async function runDigest(env, opts = {}) {
         continue;
       }
 
+      // 打印前 3 条用于调试字段是否解析正确
+      feed.slice(0, 3).forEach((v, i) => {
+        console.log(
+          `[runDigest] feed[${i}] title="${v.title}" published="${v.published}" descLen=${v.description.length} channel="${v.channelName}"`
+        );
+      });
+
       const lastId = await env.KV.get(`last:${channelId}`);
       console.log('[runDigest] lastId:', lastId);
       const newVideos = [];
@@ -287,12 +294,23 @@ async function summarizeViaGemini(video, env) {
 
 // ---------- Gemini：标题+描述 降级总结 ----------
 async function summarizeTextFallback(video, env) {
+  const title = video.title?.trim() || '未知标题';
+  const description = video.description?.trim() || '';
+  const published = video.published || '未知时间';
+  const channelName = video.channelName || '未知频道';
+
+  // 连标题都没有 → 直接返回简版，不浪费 Gemini 调用
+  if (title === '未知标题' && !description) {
+    return `⚠️ 无法获取视频信息\n\n链接：${video.link}\n请手动观看原视频。`;
+  }
+
   const prompt =
     buildSummaryPrompt() +
-    `\n\n注意：以下仅提供视频的标题、发布时间、描述等元信息（未能直接读取视频内容），请基于这些信息生成简版摘要，并在"一句话结论"后标注"（基于标题与描述整理，未读取视频内容）"。\n\n` +
-    `视频标题：${video.title}\n` +
-    `发布时间：${video.published}\n` +
-    `视频描述：${video.description || '无'}\n` +
+    `\n\n注意：以下仅提供视频的标题、频道、发布时间、描述等元信息（未能直接读取视频内容），请基于这些信息生成简版摘要，并在"一句话结论"后标注"（基于标题与描述整理，未读取视频内容）"。\n\n` +
+    `频道：${channelName}\n` +
+    `发布时间：${published}\n` +
+    `视频标题：${title}\n` +
+    `视频描述：${description || '（无描述）'}\n` +
     `视频链接：${video.link}`;
 
   const data = await geminiGenerate(env, {
@@ -330,24 +348,67 @@ async function fetchRSS(channelId) {
   const res = await fetch(rssUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
   if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
   const xml = await res.text();
+  console.log('[fetchRSS] xml length:', xml.length);
+  // 打印前 1500 字符用于调试
+  console.log('[fetchRSS] xml preview:', xml.slice(0, 1500));
   return parseFeed(xml);
 }
 
+// ---------- RSS 解析（修复：media:group / published / author / id）----------
 function parseFeed(xml) {
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
   return entries.map((e) => {
-    const get = (tag) =>
-      e.match(new RegExp(`<${tag}>([\\s\S]*?)<\\/${tag}>`))?.[1] || '';
-    const videoId = e.match(/<yt:videoId>([^<]+)/)?.[1] || '';
-    const link = e.match(/<link rel="alternate" href="([^"]+)/)?.[1] || '';
+    // 标题
+    const title = e.match(/<title>([\s\S]*?)<\/title>/)?.[1]?.trim() || '';
+
+    // 原始 <id>（用于 KV 去重）
+    const idRaw = e.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim() || '';
+
+    // 视频 ID（从 "yt:video:XXX" 提取）
+    const videoId = idRaw.includes('yt:video:')
+      ? idRaw.split('yt:video:')[1]
+      : idRaw;
+
+    // 发布时间（优先 published，其次 updated）
+    const published =
+      e.match(/<published>([\s\S]*?)<\/published>/)?.[1]?.trim() ||
+      e.match(/<updated>([\s\S]*?)<\/updated>/)?.[1]?.trim() ||
+      '';
+
+    // 链接
+    const link =
+      e.match(/<link rel="alternate" href="([^"]+)/)?.[1]?.trim() || '';
+
+    // 描述（在 <media:group><media:description> 里，这是 YouTube RSS 的真实位置）
+    const mediaGroup =
+      e.match(/<media:group>([\s\S]*?)<\/media:group>/)?.[1] || '';
+    let description = '';
+    if (mediaGroup) {
+      description =
+        mediaGroup
+          .match(/<media:description[^>]*>([\s\S]*?)<\/media:description>/)?.[1]
+          ?.trim() || '';
+    }
+    // 备选：<summary> 或 <content>
+    if (!description) {
+      description =
+        e.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim() ||
+        e.match(/<content>([\s\S]*?)<\/content>/)?.[1]?.trim() ||
+        '';
+    }
+
+    // 频道名（author > name）
+    const channelName =
+      e.match(/<author>[\s\S]*?<name>([\s\S]*?)<\/name>/)?.[1]?.trim() || '';
+
     return {
-      id: get('id'),
+      id: idRaw,
       videoId,
-      title: get('title'),
-      description: get('summary'),
-      published: get('published'),
+      title,
+      description: description.slice(0, 3000), // 截断，避免 prompt 超长
+      published,
       link,
-      author: get('author'),
+      channelName,
     };
   });
 }
@@ -358,8 +419,8 @@ async function pushWeCom(video, summary, env) {
   if (!webhook) throw new Error('WECOM_WEBHOOK not set');
 
   const content =
-    `## 📺 ${escapeMarkdown(video.title)}\n` +
-    `> 👤 频道：${escapeMarkdown(video.author || '')}\n` +
+    `## 📺 ${escapeMarkdown(video.title || '（无标题）')}\n` +
+    `> 👤 频道：${escapeMarkdown(video.channelName || '未知')}\n` +
     `> 🕐 发布：${formatDate(video.published)}\n` +
     `\n---\n` +
     `${summary}\n` +
@@ -387,13 +448,13 @@ function escapeMarkdown(str) {
 
 // 格式化发布时间为北京时间（UTC+8）
 function formatDate(iso) {
-  if (!iso) return '';
+  if (!iso) return '未知';
   try {
     const d = new Date(iso);
     const y = d.getUTCFullYear();
     const m = String(d.getUTCMonth() + 1).padStart(2, '0');
     const day = String(d.getUTCDate()).padStart(2, '0');
-    const h = String(d.getUTCHours() + 8).padStart(2, '0');
+    const h = String((d.getUTCHours() + 8) % 24).padStart(2, '0');
     const min = String(d.getUTCMinutes()).padStart(2, '0');
     return `${y}-${m}-${day} ${h}:${min}`;
   } catch {
