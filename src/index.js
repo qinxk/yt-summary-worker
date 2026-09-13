@@ -190,11 +190,11 @@ async function summarize(transcript, env) {
 
   // 方式B：兼容 OpenAI 的接口（env.LLM_URL / LLM_KEY）
   if (env.LLM_URL) {
-    const r = await fetch(env.LLM_URL, {
+    const r = await fetch(`${env.LLM_URL}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${env.LLM_KEY}`,
+        'Authorization': `Bearer ${env.LLM_KEY}`,
       },
       body: JSON.stringify({
         model: env.LLM_MODEL || 'gpt-4o-mini',
@@ -202,7 +202,10 @@ async function summarize(transcript, env) {
         max_tokens: 800,
       }),
     });
-    if (!r.ok) throw new Error(`LLM http ${r.status}: ${await r.text()}`);
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`LLM http ${r.status}: ${errText}`);
+    }
     const j = await r.json();
     return j.choices?.[0]?.message?.content || '';
   }
