@@ -142,6 +142,72 @@ export default {
       });
     }
 
+    // 单独测字幕获取：逐源报告成功/失败原因，不调 Gemini、不受配额影响。
+    // 用法：/debug/transcript?token=x&videoId=xxx（不传 videoId 则取频道最新一个）
+    if (path === '/debug/transcript') {
+      let videoId = url.searchParams.get('videoId');
+      if (!videoId) {
+        const ch = safeParseChannels(env.CHANNELS)[0];
+        if (!ch) return Response.json({ error: '无 CHANNELS，请传 videoId' }, { status: 400 });
+        const feed = await fetchRSS(ch);
+        videoId = feed[0]?.videoId;
+        if (!videoId) return Response.json({ error: 'feed 为空' }, { status: 502 });
+      }
+
+      const sources = buildTranscriptSources(videoId, env);
+      const report = [];
+      for (const { name, run: probe } of sources) {
+        const t0 = Date.now();
+        try {
+          const out = await probe();
+          const text = out.segments?.length
+            ? renderSegments(out.segments)
+            : cleanText(out.text || '');
+          report.push({
+            source: name,
+            ok: isUsableTranscript(text),
+            ms: Date.now() - t0,
+            chars: text.length,
+            segments: out.segments?.length || 0,
+            preview: text.slice(0, 120),
+          });
+        } catch (e) {
+          report.push({ source: name, ok: false, ms: Date.now() - t0, error: e.message });
+        }
+      }
+      return Response.json({
+        videoId,
+        anySuccess: report.some((r) => r.ok),
+        sources: report,
+      });
+    }
+
+    // 查看/清理去重状态。清理后下次运行会重新处理该频道最新视频。
+    // 用法：/debug/seen?token=x           查看
+    //       /debug/seen?token=x&forget=N  忘掉最近 N 个（N=1 即重推最新一条）
+    if (path === '/debug/seen') {
+      const channelId = url.searchParams.get('channel') || safeParseChannels(env.CHANNELS)[0];
+      if (!channelId) return Response.json({ error: '无 CHANNELS' }, { status: 400 });
+
+      const seen = await loadSeen(env, channelId);
+      const forget = parseInt(url.searchParams.get('forget') || '0', 10);
+
+      if (forget > 0) {
+        const kept = [...seen].slice(0, Math.max(0, seen.size - forget));
+        const dropped = [...seen].slice(kept.length);
+        await env.KV.put(`seen:${channelId}`, JSON.stringify(kept));
+        return Response.json({
+          channelId,
+          action: `已忘掉 ${dropped.length} 个`,
+          dropped,
+          remaining: kept.length,
+          note: '下次 /run-once 会重新处理这些视频',
+        });
+      }
+
+      return Response.json({ channelId, count: seen.size, ids: [...seen] });
+    }
+
     if (path === '/run-once' || path === '/') {
       const start = Date.now();
       const results = await runDigest(env, { limit: getBatchSize(env) });
