@@ -1,19 +1,20 @@
 // YouTube Digest → Summary → WeCom Bot Worker
 //
-// 架构（稳定性优先）：
+// 架构（稳定性优先，v2026-09）：
 //   RSS 拿新视频
-//     → 字幕优先（invidious/captions-api，纯文本喂 Gemini，最稳）
+//     → 字幕优先（多源轮询，纯文本喂 Gemini，最稳）
 //     → 字幕失败 → Gemini 直连 YouTube（视频理解，兜底）
 //     → 都失败 → 标题+描述 降级
-//   Gemini：模型兜底链 + 指数退避重试
+//   Gemini：模型兜底链（Gemini 3.x）+ 指数退避重试
 //   推送：企业微信（结构化 markdown）
 //
 // 关键稳定性设计：
-//   - 严格串行 + 节流（避免打爆免费层 10-15 RPM）
-//   - 单次请求 20s 超时
-//   - 503/429 指数退避 + jitter，最多 3 次
-//   - 模型链：flash → flash-lite → 2.0-flash，容量按模型隔离
-//   - 分批处理（BATCH_SIZE），KV 记录进度，避免一次 15 条
+//   - 严格串行 + 节流（避免打爆免费层 RPM）
+//   - 单次请求 20s 超时；单视频总预算 55s（超时直接降级，不卡死 Worker）
+//   - 503/429 指数退避 + jitter，每模型最多 3 次
+//   - 模型链：3.x 优先；404/400 立即跳过该模型（不再浪费重试）
+//   - 字幕源：先读 text，拦截 HTML 错误页（DOCTYPE/<html），避免 JSON 解析崩溃
+//   - 分批处理（BATCH_SIZE），KV 逐步推进
 //   - Cron 建议放凌晨（避开高峰）
 //
 // 路由：
@@ -27,30 +28,35 @@
 //   WECOM_WEBHOOK
 //   API_TOKEN
 // [vars]（wrangler.toml 明文）：
-//   GEMINI_MODELS = '["gemini-2.5-flash","gemini-2.5-flash-lite","gemini-2.0-flash"]'
+//   GEMINI_MODELS = '["gemini-3.5-flash","gemini-3.5-flash-lite","gemini-3-flash"]'
 //   CHANNELS      = '["UCxxx"]'
-//   BATCH_SIZE    = "3"      // 每次最多处理几个视频
-//   THROTTLE_MS   = "2000"   // 每条之间间隔
+//   BATCH_SIZE    = "3"
+//   THROTTLE_MS   = "2000"
 
 const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta';
-const REQUEST_TIMEOUT = 20000; // 单次请求超时
-const MAX_RETRIES = 3; // 每模型重试次数（含首次 = 最多 4 次/模型）
+const REQUEST_TIMEOUT = 20000; // 单次 Gemini 请求超时
+const PER_VIDEO_BUDGET = 55000; // 单视频总结总预算（毫秒），超时直接降级
+const MAX_RETRIES = 3; // 每模型重试次数（含首次 = 最多 4 次）
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+// 这些状态码表示"该模型不可用"，直接跳过、不重试
+const SKIP_MODEL_STATUS = new Set([400, 404, 410]);
 
-// 字幕源（免费，多源轮询）
-const TRANSCRIPT_SOURCES = [
-  // 1) youtube-captions vercel 接口
-  (videoId) =>
+// 字幕源（多源轮询，自动过滤 HTML 错误页）
+function buildTranscriptSources(videoId) {
+  return [
+    // 优先：noembed / youtube-transcript 等公共接口（按需替换为你验证可用的）
+    `https://yt-transcript-prod.onrender.com/transcript?videoId=${videoId}&lang=zh-Hans,zh,en`,
     `https://youtube-captions-api.vercel.app/api/captions?videoId=${videoId}&lang=zh-Hans,zh,en`,
-  // 2) invidious 多实例
-  ...['https://invidious.io.lol', 'https://yewtu.be', 'https://invidious.privacydev.net'].map(
-    (base) => (videoId) => `${base}/api/v1/captions/${videoId}?lang=zh-Hans,zh,en`
-  ),
-];
+    // invidious 多实例
+    `https://invidious.io.lol/api/v1/captions/${videoId}?lang=zh-Hans,zh,en`,
+    `https://yewtu.be/api/v1/captions/${videoId}?lang=zh-Hans,zh,en`,
+    `https://invidious.privacydev.net/api/v1/captions/${videoId}?lang=zh-Hans,zh,en`,
+  ];
+}
 
 export default {
   async scheduled(controller, env, ctx) {
-    // Cron：全量分批处理（最长 15 分钟）
+    // Cron：全量分批（最长 15 分钟）
     ctx.waitUntil(
       runDigest(env, { limit: Infinity }).then((results) => {
         console.log('[scheduled] done', JSON.stringify(results));
@@ -136,24 +142,26 @@ async function runDigest(env, opts = {}) {
         newVideos.push(v);
       }
 
-      // 分批：limit 以内，且不超过 BATCH_SIZE（全量时按批处理，KV 逐步推进）
       const todo = newVideos.slice(0, Math.min(limit, getBatchSize(env)));
       console.log('[runDigest] newVideos:', newVideos.length, 'todo:', todo.length);
 
       for (const video of todo) {
         console.log('[runDigest] processing:', video.title);
 
-        // 串行 + 节流（避免并发打爆免费层）
-        const summary = await summarizeWithFallback(video, env);
+        // 单视频加总预算：超时直接降级，绝不让 Worker 卡死到 60s 被取消
+        const summary = await runWithBudget(() => summarizeWithFallback(video, env), {
+          budgetMs: PER_VIDEO_BUDGET,
+          fallback: () => buildFallbackMessage(video),
+        });
+
         await pushWeCom(video, summary, env);
         console.log('[pushWeCom] ok');
         results.push({ title: video.title, status: 'ok' });
 
-        // 节流：每条之间等一下
         await sleep(getThrottleMs(env));
       }
 
-      // 推进去重标记：仅全量（Cron）时推进 1 个，分批跑完靠多次 Cron 自然推进
+      // 全量（Cron）时才推进 lastId；手动触发不推进，剩余留给 Cron
       if (feed[0] && limit === Infinity) {
         await env.KV.put(`last:${channelId}`, feed[0].id);
         console.log('[runDigest] updated lastId:', feed[0].id);
@@ -172,9 +180,26 @@ async function runDigest(env, opts = {}) {
   return results;
 }
 
+// 给单个视频总结加"总预算"，超时立即走兜底，避免拖垮整个 Worker
+async function runWithBudget(fn, { budgetMs, fallback }) {
+  const timer = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`per-video budget ${budgetMs}ms exceeded`)), budgetMs)
+  );
+  try {
+    return await Promise.race([fn(), timer]);
+  } catch (e) {
+    console.warn('[runWithBudget] timeout/failed:', e.message);
+    return fallback();
+  }
+}
+
+function buildFallbackMessage(video) {
+  return `⚠️ Gemini 当前繁忙，暂未生成摘要，请稍后查看或观看原视频。\n\n标题：${video.title || '（无标题）'}\n链接：${video.link}`;
+}
+
 // ==================== 总结（三层兜底）====================
 async function summarizeWithFallback(video, env) {
-  // 第 1 层：字幕优先（拿到字幕 → 纯文本喂 Gemini，最稳）
+  // 第 1 层：字幕优先
   try {
     const transcript = await getTranscript(video.videoId);
     if (transcript && transcript.length > 100) {
@@ -187,7 +212,7 @@ async function summarizeWithFallback(video, env) {
     console.warn('[summarize] layer1 failed:', e.message);
   }
 
-  // 第 2 层：Gemini 直连 YouTube（视频理解）
+  // 第 2 层：Gemini 直连 YouTube
   try {
     const summary = await summarizeViaGemini(video, env);
     console.log('[summarize] layer2(gemini-direct) ok');
@@ -196,52 +221,77 @@ async function summarizeWithFallback(video, env) {
     console.warn('[summarize] layer2 failed:', e.message);
   }
 
-  // 第 3 层：标题 + 描述 降级
+  // 第 3 层：标题 + 描述
   try {
     const summary = await summarizeTextFallback(video, env);
     console.log('[summarize] layer3(fallback) ok');
     return summary;
   } catch (e) {
     console.error('[summarize] layer3 failed:', e.message);
-    return `⚠️ 今日 Gemini 繁忙，未生成摘要\n\n标题：${video.title}\n链接：${video.link}`;
+    return buildFallbackMessage(video);
   }
 }
 
-// ==================== 字幕获取（多源轮询）====================
+// ==================== 字幕获取（多源 + HTML 拦截）====================
 async function getTranscript(videoId) {
-  for (let i = 0; i < TRANSCRIPT_SOURCES.length; i++) {
-    const makeUrl = TRANSCRIPT_SOURCES[i];
-    const url = makeUrl(videoId);
+  const sources = buildTranscriptSources(videoId);
+  for (let i = 0; i < sources.length; i++) {
+    const url = sources[i];
     try {
       console.log('[transcript] trying source', i + 1, url);
-      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
       if (!res.ok) {
         console.warn('[transcript] source', i + 1, 'http', res.status);
         continue;
       }
-      const data = await res.json();
-      let text = '';
 
-      // 适配不同源的结构
-      if (typeof data === 'string') {
-        text = data;
-      } else if (data.transcript) {
-        text = data.transcript;
-      } else if (Array.isArray(data)) {
-        // invidious: [{start, text}]
-        text = data.map((s) => s.text || s).join(' ');
-      } else if (data.content) {
-        text = data.content;
+      // ✅ 关键：先读文本，拦截 HTML 错误页，避免 JSON.parse("<!DOCTYPE...") 崩溃
+      const text = await res.text();
+
+      if (looksLikeHtml(text)) {
+        console.warn('[transcript] source', i + 1, 'returned html, skip');
+        continue;
       }
 
-      // 过滤限流提示页
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        console.warn('[transcript] source', i + 1, 'invalid json:', e.message);
+        continue;
+      }
+
+      let transcript = '';
+
+      // 适配不同源结构
+      if (typeof data === 'string') {
+        transcript = data;
+      } else if (data.transcript) {
+        transcript = data.transcript;
+      } else if (Array.isArray(data)) {
+        transcript = data
+          .map((s) => (typeof s === 'string' ? s : s.text || ''))
+          .join(' ');
+      } else if (data.content) {
+        transcript = data.content;
+      } else if (data.captions) {
+        // 某些源返回 { captions: [{text}] }
+        transcript = (Array.isArray(data.captions) ? data.captions : [])
+          .map((s) => s.text || '')
+          .join(' ');
+      }
+
+      transcript = (transcript || '').trim();
+
+      // 过滤限流/占位文本
       if (
-        text &&
-        text.length > 50 &&
-        !/高频|rate limit|too many requests|contact|合作方案/i.test(text)
+        transcript.length > 50 &&
+        !/高频|rate limit|too many requests|contact|合作方案|access denied/i.test(transcript)
       ) {
-        console.log('[transcript] source', i + 1, 'ok, length:', text.length);
-        return text.slice(0, 12000);
+        console.log('[transcript] source', i + 1, 'ok, length:', transcript.length);
+        return transcript.slice(0, 12000);
       }
       console.warn('[transcript] source', i + 1, 'empty or rate-limited');
     } catch (e) {
@@ -251,8 +301,15 @@ async function getTranscript(videoId) {
   throw new Error('all transcript sources failed');
 }
 
+// 判断响应是否是 HTML（错误页 / Cloudflare 拦截页）
+function looksLikeHtml(text) {
+  if (!text) return true;
+  const t = text.trim().toLowerCase();
+  return t.startsWith('<!doctype') || t.startsWith('<!DOCTYPE') || t.startsWith('<html');
+}
+
 // ==================== Gemini 调用 ====================
-// 模型兜底链：依次尝试，某模型 503/429 就换下一个
+// 模型兜底链：依次尝试，429/5xx 重试/换模型；400/404/410 立即跳过
 async function callGeminiWithModelChain(env, buildBody) {
   const models = getModels(env);
   let lastError = '';
@@ -265,13 +322,18 @@ async function callGeminiWithModelChain(env, buildBody) {
     } catch (e) {
       console.warn('[gemini] model', model, 'failed:', e.message);
       lastError = e.message;
-      // 继续尝试下一个模型
+      // 模型不可用（404/400）→ 直接换下一个，不再在这个模型上重试
+      if (e.skipModel) {
+        console.log('[gemini] skip model', model, '(unsupported)');
+        continue;
+      }
+      // 5xx/429 → 上面 geminiWithRetry 内部已重试耗尽，直接换模型
     }
   }
   throw new Error(`all models failed: ${lastError}`);
 }
 
-// 单模型 + 指数退避重试
+// 单模型 + 指数退避重试（只对 429/5xx）
 async function geminiWithRetry(env, model, body, attempt = 0) {
   const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
 
@@ -303,24 +365,31 @@ async function geminiWithRetry(env, model, body, attempt = 0) {
 
   console.warn(`[gemini] ${model} http ${status} attempt ${attempt + 1}/${MAX_RETRIES + 1}: ${detail}`);
 
-  // 不可重试的错误（key/model 配置错）
+  // 400/404/410：该模型不可用，标记跳过（不再重试）
+  if (SKIP_MODEL_STATUS.has(status)) {
+    const err = new Error(`Gemini http ${status}: ${detail}`);
+    err.skipModel = true;
+    throw err;
+  }
+
+  // 其他非重试错误（鉴权/参数）
   if (!RETRYABLE.has(status)) {
     throw new Error(`Gemini http ${status}: ${detail}`);
   }
 
-  // 重试耗尽
+  // 429/5xx：重试耗尽则抛（交给模型链换下一个）
   if (attempt >= MAX_RETRIES) {
     throw new Error(`Gemini retry exhausted: ${status} ${detail}`);
   }
 
-  // 指数退避 + jitter（503 容量问题，短睡 + 随机偏移即可）
+  // 指数退避 + jitter（短睡即可，容量问题睡久也没用）
   const wait = Math.min(1000 * 2 ** attempt + Math.floor(Math.random() * 500), 8000);
   console.log(`[gemini] retry after ${wait}ms`);
   await sleep(wait);
   return geminiWithRetry(env, model, body, attempt + 1);
 }
 
-// ---- 纯文本总结（字幕/标题描述通用）----
+// ---- 纯文本总结 ----
 async function summarizeText(text, video, env) {
   const prompt =
     buildSummaryPrompt() +
@@ -354,7 +423,7 @@ async function summarizeTextFallback(video, env) {
   const channelName = video.channelName || '未知频道';
 
   if (title === '未知标题' && !description) {
-    return `⚠️ 无法获取视频信息\n\n链接：${video.link}\n请手动观看原视频。`;
+    return buildFallbackMessage(video);
   }
 
   const prompt =
@@ -450,7 +519,15 @@ function parseFeed(xml) {
     const channelName =
       e.match(/<author>[\s\S]*?<name>([\s\S]*?)<\/name>/)?.[1]?.trim() || '';
 
-    return { id: idRaw, videoId, title, description: description.slice(0, 3000), published, link, channelName };
+    return {
+      id: idRaw,
+      videoId,
+      title,
+      description: description.slice(0, 3000),
+      published,
+      link,
+      channelName,
+    };
   });
 }
 
@@ -516,7 +593,8 @@ function getModels(env) {
     const arr = JSON.parse(env.GEMINI_MODELS || '[]');
     if (Array.isArray(arr) && arr.length) return arr;
   } catch {}
-  return ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
+  // 默认：Gemini 3.x（2026 年可用版本，按你账号实际调整）
+  return ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3-flash'];
 }
 
 function safeParseChannels(raw) {

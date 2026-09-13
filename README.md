@@ -1,61 +1,87 @@
-# yt-summary-worker（Gemini 直连版）
+# yt-summary-worker
 
-## 原理
-1. Cron / 手动触发 → 拉 YouTube RSS 拿到新视频
-2. **直接把 YouTube 链接丢给 Gemini**（`file_data.file_uri`），由 Google 自己去取字幕/音轨/画面
-3. Gemini 返回中文摘要 → 推企业微信
-4. 若 Gemini 直连失败 → 降级用「标题+描述」再总结一次
+YouTube 频道新视频监控 → Gemini 总结 → 企业微信推送（Cloudflare Worker）
 
-不再爬第三方字幕接口，彻底绕开限流。
+## 功能
+- 定时/手动抓取 YouTube 频道 RSS，识别新视频
+- 字幕优先 → Gemini 直连 YouTube → 标题+描述，三层兜底
+- Gemini 3.x 模型链 + 指数退避重试 + 单视频超时预算（绝不卡死 Worker）
+- 结构化摘要推送到企业微信机器人
 
-## 部署步骤
+## 部署
 
-### 1. 改 wrangler.toml
-把 `YOUR_KV_NAMESPACE_ID` 换成你真实的 KV 命名空间 ID（Dashboard → Workers → KV）。
-
-### 2. 设置加密变量（3 个，不要写进代码）
-```bash
-npx wrangler secret put GEMINI_API_KEY   # AI Studio 拿到的 AIzaSy...
-npx wrangler secret put API_TOKEN        # 自己编一个随机串，触发用
-npx wrangler secret put WECOM_WEBHOOK    # 企业微信机器人完整 URL
-```
-
-### 3. 安装 wrangler（首次）
+### 1. 安装 wrangler
 ```bash
 npm install -g wrangler
 wrangler login
 ```
 
-### 4. 部署
+### 2. 创建 KV（去重用）
+```bash
+wrangler kv:namespace create "KV"
+# 把输出的 id 填到 wrangler.toml 的 kv_namespaces.id
+```
+
+### 3. 设置加密变量
+```bash
+wrangler secret put GEMINI_API_KEY   # Google AI Studio 申请的 key
+wrangler secret put WECOM_WEBHOOK    # 企业微信机器人 webhook URL
+wrangler secret put API_TOKEN        # 自定义访问令牌（手动触发用）
+```
+
+### 4. 配置 wrangler.toml
+- `CHANNELS`：你的 YouTube channel_id 列表
+- `GEMINI_MODELS`：模型兜底链，**务必改成你账号实际可用的 Gemini 3.x 模型**
+- `BATCH_SIZE`：每次处理几个（默认 3）
+- `THROTTLE_MS`：视频间隔（默认 2000ms）
+- `[triggers] crons`：定时时间（默认 UTC 22:00 = 北京 06:00）
+
+### 5. 部署
 ```bash
 git add .
-git commit -m "feat: 改用 Gemini 直连 YouTube 总结"
-git push
+git commit -m "deploy"
+git push   # 若绑定 GitHub，自动部署；否则 wrangler deploy
 ```
-或本地直接 `wrangler deploy`。
 
-### 5. 验证
+## 使用
+
 ```bash
+# 手动触发（同步，限 BATCH_SIZE 个）
+curl "https://<your-worker>.workers.dev/run-once?token=<API_TOKEN>"
+
 # 健康检查
-curl https://kgchaos.eu.cc/health
+curl "https://<your-worker>.workers.dev/health"
 
-# 变量自查（确认 GEMINI key 已注入）
-curl "https://kgchaos.eu.cc/debug/env?token=你的API_TOKEN"
+# 查看变量配置
+curl "https://<your-worker>.workers.dev/debug/env?token=<API_TOKEN>"
 
-# 手动触发
-curl "https://kgchaos.eu.cc/run-once?token=你的API_TOKEN"
+# 实时日志
+wrangler tail
 ```
 
-看日志：
-```bash
-npx wrangler tail
+## 常见问题
+
+### Gemini 报 404 "model no longer available"
+→ 模型已停服。**改 `GEMINI_MODELS` 为你账号当前可用的 Gemini 3.x**（参考 AI Studio 控制台）。
+
+### 字幕源全部失败
+→ 公共字幕 API 不稳定是常态，会自动降级到 Gemini 直连/标题兜底。
+→ 可自行替换 `buildTranscriptSources()` 里更稳定的源。
+
+### Worker 被 canceled / 60s 超时
+→ 已加 `PER_VIDEO_BUDGET`（默认 55s）超时降级，不会卡死；
+→ 若仍出现，把 `BATCH_SIZE` 调小（如 1-2），Cron 放凌晨低峰。
+
+### 企业微信收不到消息
+→ 检查 `WECOM_WEBHOOK` 是否正确、机器人是否被封；
+→ 看 `wrangler tail` 里 `[pushWeCom]` 日志。
+
+## 架构说明
 ```
-
-## 关于 Gemini YouTube 直连
-- 用的是 Gemini API 的 `file_data.file_uri` 能力（preview 功能）
-- 模型用 `gemini-2.5-flash`：免费层够个人定时任务用
-- 若某个视频地区/版权限制导致直连失败，会自动降级到「标题+描述」简版
-
-## 目录
-- src/index.js    主代码（整文件替换）
-- wrangler.toml   配置（改 KV id + 明文变量）
+RSS → 新视频检测(KV去重)
+  → 字幕多源 → Gemini 文本总结   [Layer 1，最稳]
+  → Gemini 直连 YouTube          [Layer 2]
+  → 标题+描述兜底                 [Layer 3]
+  → 全部失败：发简版提示           [绝不静默]
+→ 企业微信推送
+```

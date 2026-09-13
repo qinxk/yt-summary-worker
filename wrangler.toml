@@ -1,21 +1,32 @@
 name = "yt-summary-worker"
 main = "src/index.js"
-compatibility_date = "2024-09-01"
+compatibility_date = "2025-01-01"
 
 [observability]
 enabled = true
 head_sampling_rate = 1
 
 [vars]
-CHANNELS     = '["UCkHrq03gWLLx6vjS2DOJ8aA"]'
-GEMINI_MODEL = "gemini-2.5-flash"
-SUMMARY_PROVIDER = "gemini"
+# 监控的 YouTube 频道（channel_id 列表）
+CHANNELS = ["UCkHrq03gWLLx6vjS2DOJ8aA"]
+
+# Gemini 模型兜底链（2026 年：3.x 系列，按你账号实际可用模型调整）
+# 调用顺序：依次尝试，429/5xx 重试，404/400 立即跳过换下一个
+GEMINI_MODELS = '["gemini-3.5-flash","gemini-3.5-flash-lite","gemini-3-flash"]'
+GEMINI_MODEL = "gemini-3.5-flash"
+
+# 每次触发最多处理的视频数（分批，避免超时）
+BATCH_SIZE = "3"
+
+# 每条视频之间的节流间隔（毫秒），避免打爆免费层 RPM
+THROTTLE_MS = "2000"
+
+# Cron 触发：每天 UTC 22:00 = 北京时间 06:00（避开晚高峰）
+# 如需改时间，调整此处即可
+[triggers]
+crons = ["0 22 * * *"]
 
 [[kv_namespaces]]
 binding = "KV"
-id = "178d6588564149eb8b80d92d8d51386d"   # ← 换成你真实的 KV 命名空间 ID
-
-# 敏感变量请用 wrangler secret 设置（不要写进 toml）：
-#   npx wrangler secret put GEMINI_API_KEY
-#   npx wrangler secret put API_TOKEN
-#   npx wrangler secret put WECOM_WEBHOOK
+id = "178d6588564149eb8b80d92d8d51386d"
+preview_id = "178d6588564149eb8b80d92d8d51386d"
