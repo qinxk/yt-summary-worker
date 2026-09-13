@@ -5,7 +5,7 @@
 //
 // 路由：
 //   GET /health             免鉴权
-//   GET /debug/env?token=x  查变量
+//   GET /debug/env?token=x  查变量（不暴露密钥明文）
 //   GET /run-once?token=x   手动触发（同步、限1个）
 //   GET /?token=x           兼容入口
 //
@@ -18,10 +18,11 @@
 //   CHANNELS     = '["UCxxx"]'
 
 const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta';
+const REQUEST_TIMEOUT = 20000; // 单次 Gemini 请求 20s 超时
 
 export default {
   async scheduled(controller, env, ctx) {
-    // Cron：全量处理（Cron 最长 15 分钟，无 30s waitUntil 限制）
+    // Cron：全量处理（Cron 最长 15 分钟，无 30s 限制）
     ctx.waitUntil(
       runDigest(env, { limit: Infinity }).then((results) => {
         console.log('[scheduled] done', JSON.stringify(results));
@@ -65,9 +66,12 @@ export default {
 
     // 4) 手动触发：同步跑，只处理最新 1 个（避免 30s 超时掐断推送）
     if (path === '/run-once' || path === '/') {
+      const start = Date.now();
       const results = await runDigest(env, { limit: 1 });
+      const cost = Date.now() - start;
       return Response.json({
         status: 'done',
+        costMs: cost,
         note: '已处理最新 1 个视频（全量由 Cron 自动触发），查看企业微信 / wrangler tail',
         results,
       });
@@ -118,19 +122,20 @@ async function runDigest(env, opts = {}) {
 
         // 串行：逐条总结+推送，避免并发打爆 Gemini 免费层
         let summary = '';
+
+        // 方式1：Gemini 直连 YouTube（带 503 立即重试 + 超时控制）
         try {
-          // 方式1：Gemini 直连 YouTube（带 503 指数退避重试）
           summary = await summarizeViaGemini(video, env);
           console.log('[summarize] gemini-direct ok, length:', summary.length);
         } catch (e) {
           console.error('[summarize] gemini-direct failed:', e.message);
-          // 方式2：标题+描述 降级再试一次
+          // 方式2：标题+描述 降级（同样带重试 + 超时）
           try {
             summary = await summarizeTextFallback(video, env);
             console.log('[summarize] fallback ok, length:', summary.length);
           } catch (e2) {
             console.error('[summarize] fallback failed:', e2.message);
-            summary = `⚠️ 今日 Gemini 繁忙，未生成摘要\n标题：${video.title}\n链接：${video.link}`;
+            summary = `⚠️ 今日 Gemini 繁忙，未生成摘要\n\n标题：${video.title}\n链接：${video.link}`;
           }
         }
 
@@ -139,11 +144,6 @@ async function runDigest(env, opts = {}) {
           console.log('[pushWeCom] ok');
         } catch (e) {
           console.error('[pushWeCom] failed:', e.message);
-        }
-
-        // 节流：两条之间停顿，降低 429/503
-        if (todo.indexOf(video) < todo.length - 1) {
-          await scheduler.wait(800);
         }
 
         results.push({ title: video.title, status: 'ok' });
@@ -170,18 +170,34 @@ async function runDigest(env, opts = {}) {
   return results;
 }
 
-// ---------- Gemini：指数退避重试 ----------
+// ---------- Gemini：超时控制 + 503 立即重试（不延迟）----------
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const MAX_RETRIES = 2; // 总共最多 3 次（首次 + 2 次重试）
 
-async function geminiGenerate(env, body, attempt = 0, maxRetries = 4) {
+async function geminiGenerate(env, body, attempt = 0) {
   const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
   const url = `${GEMINI_ENDPOINT}/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  // 20 秒超时，防止单次请求挂死
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') {
+      throw new Error(`Gemini request timeout after ${REQUEST_TIMEOUT}ms`);
+    }
+    throw e;
+  }
+  clearTimeout(timer);
 
   if (res.ok) {
     return await res.json();
@@ -193,23 +209,18 @@ async function geminiGenerate(env, body, attempt = 0, maxRetries = 4) {
     detail = (await res.json())?.error?.message || '';
   } catch {}
 
-  console.warn(`[gemini] http ${status} attempt ${attempt + 1}/${maxRetries + 1}: ${detail}`);
+  console.warn(`[gemini] http ${status} attempt ${attempt + 1}/${MAX_RETRIES + 1}: ${detail}`);
 
-  // 不可重试（key/model 错）或已达上限 → 抛出
-  if (!RETRYABLE.has(status) || attempt >= maxRetries) {
-    const err = new Error(`Gemini http ${status}: ${detail}`);
-    err.status = status;
-    throw err;
+  // 503/5xx：立即重试，不做延迟（免费层延迟几秒也没用）
+  if (RETRYABLE.has(status) && attempt < MAX_RETRIES) {
+    console.log(`[gemini] retry ${attempt + 1}/${MAX_RETRIES} immediately`);
+    return geminiGenerate(env, body, attempt + 1);
   }
 
-  // 指数退避 + jitter：~1s, ~2s, ~4s, ~8s
-  const base = 1000 * Math.pow(2, attempt);
-  const jitter = Math.floor(Math.random() * 500);
-  const waitMs = Math.min(base + jitter, 15000);
-  console.log(`[gemini] retry after ${waitMs}ms`);
-  await scheduler.wait(waitMs);
-
-  return geminiGenerate(env, body, attempt + 1, maxRetries);
+  // 不可重试（key/model 错）或重试耗尽 → 抛出
+  const err = new Error(`Gemini http ${status}: ${detail}`);
+  err.status = status;
+  throw err;
 }
 
 // ---------- Prompt：结构化分段 + 时间戳 + 自动分类 ----------
@@ -326,7 +337,7 @@ function parseFeed(xml) {
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
   return entries.map((e) => {
     const get = (tag) =>
-      e.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`))?.[1] || '';
+      e.match(new RegExp(`<${tag}>([\\s\S]*?)<\\/${tag}>`))?.[1] || '';
     const videoId = e.match(/<yt:videoId>([^<]+)/)?.[1] || '';
     const link = e.match(/<link rel="alternate" href="([^"]+)/)?.[1] || '';
     return {
@@ -336,6 +347,7 @@ function parseFeed(xml) {
       description: get('summary'),
       published: get('published'),
       link,
+      author: get('author'),
     };
   });
 }
@@ -345,7 +357,6 @@ async function pushWeCom(video, summary, env) {
   const webhook = env.WECOM_WEBHOOK;
   if (!webhook) throw new Error('WECOM_WEBHOOK not set');
 
-  // 结构化排版：标题块 + 分割线 + 摘要正文 + 底部链接
   const content =
     `## 📺 ${escapeMarkdown(video.title)}\n` +
     `> 👤 频道：${escapeMarkdown(video.author || '')}\n` +
@@ -368,13 +379,13 @@ async function pushWeCom(video, summary, env) {
   return j;
 }
 
-// 转义企业微信 markdown 特殊字符（避免排版错乱）
+// 转义企业微信 markdown 特殊字符
 function escapeMarkdown(str) {
   if (!str) return '';
   return str.replace(/\|/g, '\\|').replace(/\n/g, ' ').trim();
 }
 
-// 格式化发布时间为北京时间
+// 格式化发布时间为北京时间（UTC+8）
 function formatDate(iso) {
   if (!iso) return '';
   try {
@@ -382,7 +393,7 @@ function formatDate(iso) {
     const y = d.getUTCFullYear();
     const m = String(d.getUTCMonth() + 1).padStart(2, '0');
     const day = String(d.getUTCDate()).padStart(2, '0');
-    const h = String(d.getUTCHours() + 8).padStart(2, '0'); // UTC+8
+    const h = String(d.getUTCHours() + 8).padStart(2, '0');
     const min = String(d.getUTCMinutes()).padStart(2, '0');
     return `${y}-${m}-${day} ${h}:${min}`;
   } catch {
