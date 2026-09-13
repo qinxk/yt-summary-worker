@@ -46,7 +46,7 @@ export default {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // 4) 手动触发
+    // 4) 手动触发（用 ctx.waitUntil 保证后台任务跑完、日志完整）
     if (path === '/run-once' || path === '/') {
       ctx.waitUntil(
         runDigest(env).then((results) => {
@@ -73,14 +73,12 @@ async function runDigest(env) {
     console.error('[runDigest] CHANNELS 为空');
     return [{ status: 'error', error: 'CHANNELS 为空' }];
   }
-
   console.log('[runDigest] channels:', JSON.stringify(channels));
 
   for (const channelId of channels) {
     try {
       console.log('[runDigest] processing channel:', channelId);
 
-      // 1. RSS
       const feed = await fetchRSS(channelId);
       console.log('[runDigest] feed count:', feed.length);
       if (!feed.length) {
@@ -88,7 +86,6 @@ async function runDigest(env) {
         continue;
       }
 
-      // 2. KV 去重
       const lastId = await env.KV.get(`last:${channelId}`);
       console.log('[runDigest] lastId:', lastId);
       const newVideos = [];
@@ -101,43 +98,51 @@ async function runDigest(env) {
       for (const video of newVideos) {
         console.log('[runDigest] summarizing:', video.title);
 
-        // 3. 字幕
-        let transcript = '';
-        try {
-          transcript = await getTranscript(video.videoId);
-          console.log('[transcript] ok, length:', transcript.length);
-        } catch (e) {
-          console.warn('[transcript] failed, fallback to description:', e.message);
-          transcript = video.description || '';
+        // 1) 多源轮询拿字幕
+        let transcript = await getTranscriptWithFallback(video.videoId);
+        console.log('[transcript] final length:', transcript.length);
+
+        // 2) 字幕太短/无效 → 用标题+描述兜底，并标注原因
+        let noSubtitle = false;
+        if (transcript.trim().length < 30) {
+          noSubtitle = true;
+          transcript =
+            `标题：${video.title}\n` +
+            `发布：${video.published}\n` +
+            `描述：${video.description || '无'}\n` +
+            `（说明：未获取到字幕，以下基于标题与描述生成）`;
         }
 
-        // 4. 总结
+        // 3. 组装给 LLM 的正文
+        const body = noSubtitle
+          ? transcript
+          : `视频标题：${video.title}\n\n字幕：\n${transcript}`;
+
         let summary = '';
         try {
-          summary = await summarize(transcript, env);
+          summary = await summarize(body, env);
           console.log('[summarize] ok, length:', summary.length);
         } catch (e) {
           console.error('[summarize] failed:', e.message);
           summary = `摘要生成失败: ${e.message}`;
         }
 
-        // 5. 推送
+        // 4. 推送（无字幕时在开头注明）
+        const prefix = noSubtitle ? '⚠️ 该视频无可用字幕，以下基于标题/描述整理\n\n' : '';
         try {
-          await pushWeCom(video, summary, env);
+          await pushWeCom(video, prefix + summary, env);
           console.log('[pushWeCom] ok');
         } catch (e) {
           console.error('[pushWeCom] failed:', e.message);
         }
 
-        results.push({ title: video.title, status: 'ok' });
+        results.push({ title: video.title, status: 'ok', noSubtitle });
       }
 
-      // 6. 更新去重标记
       if (feed[0]) {
         await env.KV.put(`last:${channelId}`, feed[0].id);
         console.log('[runDigest] updated lastId:', feed[0].id);
       }
-
       results.push({ channel: channelId, status: 'done', processed: newVideos.length });
     } catch (err) {
       console.error('[runDigest] channel error:', channelId, err.message);
@@ -147,6 +152,90 @@ async function runDigest(env) {
 
   console.log('[runDigest] finished, results:', JSON.stringify(results));
   return results;
+}
+
+// ---------- 字幕：多源轮询 + 兜底 ----------
+async function getTranscriptWithFallback(videoId) {
+  // 每个 source 返回字幕文本（纯字符串），失败抛错
+  const sources = [
+    // 源1：原 youtube-transcript.ai
+    async () => {
+      const res = await fetch(
+        `https://youtube-transcript.ai/transcript/${videoId}.txt?lang=zh-Hans,zh,en`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      if (!res.ok) throw new Error(`src1 status ${res.status}`);
+      const text = await res.text();
+      // 若返回的是“限流提示页”，当无效处理
+      if (/高频调用|速率|rate limit|请联系|联系我/i.test(text)) {
+        throw new Error('src1 returned limit page');
+      }
+      return text;
+    },
+    // 源2：vercel 中转
+    async () => {
+      const res = await fetch(
+        `https://youtube-captions-api.vercel.app/api/captions?videoId=${videoId}&lang=zh-Hans,zh,en`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' } }
+      );
+      if (!res.ok) throw new Error(`src2 status ${res.status}`);
+      const data = await res.json();
+      const t = data && (data.transcript || data.text || '');
+      if (!t) throw new Error('src2 empty');
+      return typeof t === 'string' ? t : JSON.stringify(t);
+    },
+    // 源3：Invidious 实例轮询
+    async () => {
+      const instances = [
+        'https://invidious.io.lol',
+        'https://yewtu.be',
+        'https://invidious.privacydev.net',
+      ];
+      let lastErr = '';
+      for (const base of instances) {
+        try {
+          const res = await fetch(
+            `${base}/api/v1/captions/${videoId}?lang=zh-Hans,zh,en`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' } }
+          );
+          if (!res.ok) {
+            lastErr = `src3 ${base} status ${res.status}`;
+            continue;
+          }
+          const list = await res.json();
+          if (!Array.isArray(list) || !list.length) {
+            lastErr = `src3 ${base} empty`;
+            continue;
+          }
+          // 不同实例字段可能不同：text / content
+          return list
+            .map((s) => s.text || s.content || '')
+            .join(' ')
+            .trim();
+        } catch (e) {
+          lastErr = `src3 ${base}: ${e.message}`;
+          continue;
+        }
+      }
+      throw new Error(lastErr || 'src3 all failed');
+    },
+  ];
+
+  for (let i = 0; i < sources.length; i++) {
+    try {
+      const text = await sources[i]();
+      if (text && text.trim().length >= 30) {
+        console.log(`[transcript] source ${i + 1} ok`);
+        return text.trim().slice(0, 12000);
+      }
+      console.warn(`[transcript] source ${i + 1} too short`);
+    } catch (e) {
+      console.warn(`[transcript] source ${i + 1} failed:`, e.message);
+    }
+  }
+
+  // 所有源都失败 → 返回空，由上层用标题+描述兜底
+  return '';
 }
 
 // ---------- 工具 ----------
@@ -174,7 +263,8 @@ async function fetchRSS(channelId) {
 function parseFeed(xml) {
   const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
   return entries.map((e) => {
-    const get = (tag) => e.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`))?.[1] || '';
+    const get = (tag) =>
+      e.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`))?.[1] || '';
     const videoId = e.match(/<yt:videoId>([^<]+)/)?.[1] || '';
     const link = e.match(/<link rel="alternate" href="([^"]+)/)?.[1] || '';
     return {
@@ -188,22 +278,9 @@ function parseFeed(xml) {
   });
 }
 
-// ---------- 字幕 ----------
-async function getTranscript(videoId) {
-  // 方案1：使用 youtube-captions 的公开接口
-  const res = await fetch(
-    `https://youtube-captions-api.vercel.app/api/captions?videoId=${videoId}&lang=zh-Hans,zh,en`,
-    { headers: { 'User-Agent': 'Mozilla/5.0' } }
-  );
-  if (!res.ok) throw new Error(`transcript fetch failed: ${res.status}`);
-  const data = await res.json();
-  if (data.transcript) return data.transcript.slice(0, 12000);
-  throw new Error('no transcript in response');
-}
-
 // ---------- LLM 总结 ----------
 async function summarize(transcript, env) {
-  const prompt = `请用中文把以下 YouTube 视频字幕整理成摘要，输出：1)一句话结论；2)3-5个要点（带大致时间）；3)值得关注的关键信息。\n\n字幕：\n${transcript}`;
+  const prompt = `请用中文把以下 YouTube 视频内容整理成摘要，输出：1)一句话结论；2)3-5个要点（若内容带时间戳请标注，否则按内容顺序给大致位置区间）；3)值得关注的关键信息。\n\n${transcript}`;
 
   // 方式A：Workers AI
   if (env.AI) {
@@ -225,7 +302,7 @@ async function summarize(transcript, env) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${env.LLM_KEY}`,
+        Authorization: `Bearer ${env.LLM_KEY}`,
       },
       body: JSON.stringify({
         model: env.LLM_MODEL || 'gpt-4o-mini',
@@ -246,6 +323,7 @@ async function summarize(transcript, env) {
     return j.choices?.[0]?.message?.content || '';
   }
 
+  // 兜底：无模型时用字幕/描述前 500 字
   return transcript.slice(0, 500);
 }
 
@@ -254,7 +332,11 @@ async function pushWeCom(video, summary, env) {
   const webhook = env.WECOM_WEBHOOK;
   if (!webhook) throw new Error('WECOM_WEBHOOK not set');
 
-  const content = `## 📺 ${video.title}\n> 发布：${video.published}\n> 链接：${video.link}\n\n**摘要：**\n${summary}`;
+  const content =
+    `## 📺 ${video.title}\n` +
+    `> 发布：${video.published}\n` +
+    `> 链接：${video.link}\n\n` +
+    `**摘要：**\n${summary}`;
 
   const r = await fetch(webhook, {
     method: 'POST',
