@@ -19,7 +19,10 @@ const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta';
 
 export default {
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(runDigest(env));
+    // Cron 触发：处理全部新视频（Cron 有最长 15 分钟，无 30 秒 waitUntil 限制）
+    ctx.waitUntil(runDigest(env, { limit: Infinity }).then((results) => {
+      console.log('[scheduled] done', JSON.stringify(results));
+    }));
   },
 
   async fetch(request, env, ctx) {
@@ -56,16 +59,14 @@ export default {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // 4) 手动触发（ctx.waitUntil 保证后台跑完、日志完整）
+    // 4) 手动触发：同步跑，且只处理最新 1 个视频
+    //    （避免 waitUntil 30 秒超时把企业微信推送掐断）
     if (path === '/run-once' || path === '/') {
-      ctx.waitUntil(
-        runDigest(env).then((results) => {
-          console.log('[runDigest] done', JSON.stringify(results));
-        })
-      );
+      const results = await runDigest(env, { limit: 1 });
       return Response.json({
-        status: 'triggered',
-        note: '任务已在后台执行，查看企业微信 / wrangler tail',
+        status: 'done',
+        note: '已处理最新 1 个视频（如需全量请等待 Cron 自动触发），查看企业微信 / wrangler tail',
+        results,
       });
     }
 
@@ -74,8 +75,12 @@ export default {
 };
 
 // ---------- 主流程 ----------
-async function runDigest(env) {
-  console.log('[runDigest] start');
+// opts.limit：本次最多处理的视频数（默认 Infinity，即全量）
+//   - Cron 调用：limit = Infinity，处理全部新视频
+//   - 手动 /run-once：limit = 1，只处理最新 1 个，保证 30 秒内跑完推送
+async function runDigest(env, opts = {}) {
+  const limit = opts.limit != null ? opts.limit : Infinity;
+  console.log('[runDigest] start, limit:', limit);
   ensureConfig(env);
 
   const channels = safeParseChannels(env.CHANNELS);
@@ -105,9 +110,11 @@ async function runDigest(env) {
         if (v.id === lastId) break;
         newVideos.push(v);
       }
-      console.log('[runDigest] newVideos count:', newVideos.length);
+      // 只处理最新的 limit 个，其余留给下次 Cron
+      const todo = newVideos.slice(0, limit);
+      console.log('[runDigest] newVideos count:', newVideos.length, 'todo:', todo.length);
 
-      for (const video of newVideos) {
+      for (const video of todo) {
         console.log('[runDigest] summarizing:', video.title);
 
         // 直接用 YouTube 链接让 Gemini 总结（方案 A）
@@ -138,10 +145,16 @@ async function runDigest(env) {
       }
 
       if (feed[0]) {
-        await env.KV.put(`last:${channelId}`, feed[0].id);
-        console.log('[runDigest] updated lastId:', feed[0].id);
+        // 仅全量（Cron，limit=Infinity）时推进去重标记
+        // 手动触发（limit=1）不更新，保证剩余视频下次 Cron 会继续处理
+        if (limit === Infinity) {
+          await env.KV.put(`last:${channelId}`, feed[0].id);
+          console.log('[runDigest] updated lastId:', feed[0].id);
+        } else {
+          console.log('[runDigest] skip update lastId (partial run)');
+        }
       }
-      results.push({ channel: channelId, status: 'done', processed: newVideos.length });
+      results.push({ channel: channelId, status: 'done', processed: todo.length });
     } catch (err) {
       console.error('[runDigest] channel error:', channelId, err.message);
       results.push({ channel: channelId, status: 'error', error: err.message });
